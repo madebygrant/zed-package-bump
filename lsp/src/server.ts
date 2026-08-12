@@ -33,10 +33,18 @@ const DEP_SECTIONS = [
 /* ranges we know how to bump: optional ^/~ prefix + full semver */
 const UPDATABLE_RE = /^([\^~]?)(\d+)\.(\d+)\.(\d+)(-[\w.-]+)?$/;
 
+interface TierUpdate {
+  level: BumpLevel;
+  version: string;
+}
+
 interface DepFinding {
   name: string;
   current: string;
+  /* highest available update — target of "update all" */
   latest: string;
+  /* newest patch / minor / major updates, ascending, deduped */
+  tiers: TierUpdate[];
   /* range of the version string between the quotes */
   range: Range;
 }
@@ -54,7 +62,7 @@ const metaCache = new Map<string, CacheEntry>();
    compact:  "→ 10.8.1 (major)"
    level:    "major" */
 type MessageStyle = 'complete' | 'compact' | 'level';
-let messageStyle: MessageStyle = 'complete';
+let messageStyle: MessageStyle = 'compact';
 let checkVulnerabilities = true;
 
 function applySettings(settings: unknown): void {
@@ -113,12 +121,6 @@ function semverCmp(a: string, b: string): number {
   return comparePre(pa[3], pb[3]);
 }
 
-function semverGt(a: string, b: string): boolean {
-  return parseSemver(a) !== null && parseSemver(b) !== null
-    ? semverCmp(a, b) > 0
-    : false;
-}
-
 /* npm advisory ranges: comparators AND-ed by spaces, alternatives OR-ed
    by ||, e.g. ">=4.0.0 <4.17.21", "<1.2.3 || >=2.0.0 <2.1.0", "*" */
 function parseComparator(c: string): { op: string; v: string } | null {
@@ -164,13 +166,45 @@ function satisfiesRange(version: string, range: string): boolean {
 
 type BumpLevel = 'major' | 'minor' | 'patch';
 
-function bumpLevel(current: string, latest: string): BumpLevel {
+/* newest stable update per tier: patch (same major.minor), minor (same
+   major), major — only versions above `current` and at or below the
+   `latest` dist-tag, so pre-releases published past `latest` stay hidden */
+function tierUpdates(
+  versions: string[],
+  current: string,
+  latest: string,
+): TierUpdate[] {
   const pc = parseSemver(current);
+  if (!pc) return [];
+  let patch: string | null = null;
+  let minor: string | null = null;
+  let major: string | null = null;
+  for (const v of versions) {
+    const p = parseSemver(v);
+    if (!p || p[3]) continue;
+    if (semverCmp(v, current) <= 0 || semverCmp(v, latest) > 0) continue;
+    if (p[0] === pc[0] && p[1] === pc[1]) {
+      if (!patch || semverCmp(v, patch) > 0) patch = v;
+    } else if (p[0] === pc[0]) {
+      if (!minor || semverCmp(v, minor) > 0) minor = v;
+    } else if ((p[0] as number) > (pc[0] as number)) {
+      if (!major || semverCmp(v, major) > 0) major = v;
+    }
+  }
+  const tiers: TierUpdate[] = [];
+  if (patch) tiers.push({ level: 'patch', version: patch });
+  if (minor) tiers.push({ level: 'minor', version: minor });
+  if (major) tiers.push({ level: 'major', version: major });
+
+  /* no stable tier but latest is still newer (prerelease-only package, or
+     a prerelease bump like rc.1 → rc.2) — offer latest itself */
   const pl = parseSemver(latest);
-  if (!pc || !pl) return 'patch';
-  if (pl[0] !== pc[0]) return 'major';
-  if (pl[1] !== pc[1]) return 'minor';
-  return 'patch';
+  if (!tiers.length && pl && semverCmp(latest, current) > 0) {
+    const level: BumpLevel =
+      pl[0] !== pc[0] ? 'major' : pl[1] !== pc[1] ? 'minor' : 'patch';
+    tiers.push({ level, version: latest });
+  }
+  return tiers;
 }
 
 /* color coding via severity: major=Warning, minor=Information,
@@ -413,7 +447,11 @@ const pendingValidation = new Map<string, NodeJS.Timeout>();
 /* findings per uri, consumed by code actions */
 const findingsByUri = new Map<string, DepFinding[]>();
 /* vulnerable deps with a known safe version, per uri; `latest` holds the fix */
-interface VulnFix extends DepFinding {
+interface VulnFix {
+  name: string;
+  current: string;
+  latest: string;
+  range: Range;
   advisoryCount: number;
 }
 const vulnFixesByUri = new Map<string, VulnFix[]>();
@@ -457,27 +495,36 @@ async function validate(uri: string): Promise<void> {
 
   const findings: DepFinding[] = [];
   for (const site of sites) {
-    const latest = metaByName.get(site.name)?.latest;
-    if (!latest) continue;
+    const meta = metaByName.get(site.name);
+    if (!meta?.latest) continue;
     const bare = site.current.replace(/^[\^~]/, '');
-    if (semverGt(latest, bare)) {
-      findings.push({ ...site, latest });
-    }
+    /* no version list (unusual registry response) → fall back to latest */
+    const pool = meta.versions.length ? meta.versions : [meta.latest];
+    const tiers = tierUpdates(pool, bare, meta.latest);
+    if (!tiers.length) continue;
+    findings.push({
+      ...site,
+      latest: tiers[tiers.length - 1].version,
+      tiers,
+    });
   }
   findingsByUri.set(uri, findings);
 
   const diagnostics: Diagnostic[] = findings.map((f) => {
     const bare = f.current.replace(/^[\^~]/, '');
-    const level = bumpLevel(bare, f.latest);
+    const highest = f.tiers[f.tiers.length - 1];
+    const list = f.tiers
+      .map((t) => `${t.version} (${t.level})`)
+      .join(' | ');
     const message =
       messageStyle === 'level'
-        ? level
+        ? highest.level
         : messageStyle === 'compact'
-          ? `→ ${f.latest} (${level})`
-          : `${f.name}: ${bare} → ${f.latest} (${level})`;
+          ? `→ ${list}`
+          : `${f.name}: ${bare} → ${list}`;
     return {
       range: f.range,
-      severity: SEVERITY_BY_LEVEL[level],
+      severity: SEVERITY_BY_LEVEL[highest.level],
       source: 'package-bump',
       message,
       data: { name: f.name, latest: f.latest },
@@ -580,9 +627,12 @@ async function validate(uri: string): Promise<void> {
 
 // ---------- code actions ----------
 
-function bumpEdit(f: DepFinding): TextEdit {
+function bumpEdit(
+  f: Pick<DepFinding, 'current' | 'latest' | 'range'>,
+  version = f.latest,
+): TextEdit {
   const prefix = /^[\^~]/.exec(f.current)?.[0] ?? '';
-  return { range: f.range, newText: `${prefix}${f.latest}` };
+  return { range: f.range, newText: `${prefix}${version}` };
 }
 
 connection.onCodeAction((params) => {
@@ -593,21 +643,29 @@ connection.onCodeAction((params) => {
 
   const actions: CodeAction[] = [];
 
-  const overlapsCursor = (f: DepFinding) =>
+  const overlapsCursor = (f: { range: Range }) =>
     f.range.start.line <= params.range.end.line &&
     f.range.end.line >= params.range.start.line;
 
-  /* a vuln fix to the same version as latest would duplicate the bump action */
-  for (const f of vulnFixes.filter(overlapsCursor)) {
+  const fixLabel = (f: VulnFix) =>
+    f.advisoryCount === 1
+      ? 'fixes the vulnerability'
+      : `fixes all ${f.advisoryCount} vulnerabilities`;
+
+  const vulnInRange = vulnFixes.filter(overlapsCursor);
+
+  /* a vuln fix matching a tier version would duplicate that tier's action —
+     skip it here; the tier action below carries the fix label instead */
+  for (const f of vulnInRange) {
     const shadowedByBump = findings.some(
-      (b) => b.name === f.name && b.range.start.line === f.range.start.line && b.latest === f.latest,
+      (b) =>
+        b.name === f.name &&
+        b.range.start.line === f.range.start.line &&
+        b.tiers.some((t) => t.version === f.latest),
     );
     if (shadowedByBump) continue;
     actions.push({
-      title:
-        f.advisoryCount === 1
-          ? `Update ${f.name} to ${f.latest} (fixes the vulnerability)`
-          : `Update ${f.name} to ${f.latest} (fixes all ${f.advisoryCount} vulnerabilities)`,
+      title: `Update ${f.name} to ${f.latest} (${fixLabel(f)})`,
       kind: CodeActionKind.QuickFix,
       diagnostics: params.context.diagnostics.filter(
         (d) =>
@@ -623,25 +681,36 @@ connection.onCodeAction((params) => {
   const inRange = findings.filter(overlapsCursor);
 
   for (const f of inRange) {
-    actions.push({
-      title: `Update ${f.name} to ${f.latest}`,
-      kind: CodeActionKind.QuickFix,
-      diagnostics: params.context.diagnostics.filter(
-        (d) =>
-          d.source === 'package-bump' &&
-          (d.data as { name?: string } | undefined)?.name === f.name &&
-          d.range.start.line === f.range.start.line &&
-          d.range.start.character === f.range.start.character,
-      ),
-      edit: { changes: { [uri]: [bumpEdit(f)] } },
-    });
+    const attached = params.context.diagnostics.filter(
+      (d) =>
+        d.source === 'package-bump' &&
+        (d.data as { name?: string } | undefined)?.name === f.name &&
+        d.range.start.line === f.range.start.line &&
+        d.range.start.character === f.range.start.character,
+    );
+    const vulnFix = vulnInRange.find(
+      (v) =>
+        v.name === f.name && v.range.start.line === f.range.start.line,
+    );
+    /* highest tier first so "update to latest" leads the menu */
+    for (const t of [...f.tiers].reverse()) {
+      actions.push({
+        title:
+          vulnFix && vulnFix.latest === t.version
+            ? `Update ${f.name} to ${t.version} (${t.level}, ${fixLabel(vulnFix)})`
+            : `Update ${f.name} to ${t.version} (${t.level})`,
+        kind: CodeActionKind.QuickFix,
+        diagnostics: attached,
+        edit: { changes: { [uri]: [bumpEdit(f, t.version)] } },
+      });
+    }
   }
 
   if (findings.length > 1) {
     actions.push({
       title: `Update all ${findings.length} outdated packages`,
       kind: CodeActionKind.SourceFixAll,
-      edit: { changes: { [uri]: findings.map(bumpEdit) } },
+      edit: { changes: { [uri]: findings.map((f) => bumpEdit(f)) } },
     });
   }
 

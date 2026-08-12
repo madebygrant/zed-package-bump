@@ -9119,7 +9119,7 @@ var DEP_SECTIONS = [
 ];
 var UPDATABLE_RE = /^([\^~]?)(\d+)\.(\d+)\.(\d+)(-[\w.-]+)?$/;
 var metaCache = /* @__PURE__ */ new Map();
-var messageStyle = "complete";
+var messageStyle = "compact";
 var checkVulnerabilities = true;
 function applySettings(settings) {
   const s = settings;
@@ -9164,9 +9164,6 @@ function semverCmp(a, b) {
   }
   return comparePre(pa[3], pb[3]);
 }
-function semverGt(a, b) {
-  return parseSemver(a) !== null && parseSemver(b) !== null ? semverCmp(a, b) > 0 : false;
-}
 function parseComparator(c) {
   if (c === "*") return { op: "*", v: "" };
   const m = /^(<=|>=|<|>|=)?(.+)$/.exec(c);
@@ -9202,13 +9199,34 @@ function satisfiesRange(version, range) {
     });
   });
 }
-function bumpLevel(current, latest) {
+function tierUpdates(versions, current, latest) {
   const pc = parseSemver(current);
+  if (!pc) return [];
+  let patch = null;
+  let minor = null;
+  let major = null;
+  for (const v of versions) {
+    const p = parseSemver(v);
+    if (!p || p[3]) continue;
+    if (semverCmp(v, current) <= 0 || semverCmp(v, latest) > 0) continue;
+    if (p[0] === pc[0] && p[1] === pc[1]) {
+      if (!patch || semverCmp(v, patch) > 0) patch = v;
+    } else if (p[0] === pc[0]) {
+      if (!minor || semverCmp(v, minor) > 0) minor = v;
+    } else if (p[0] > pc[0]) {
+      if (!major || semverCmp(v, major) > 0) major = v;
+    }
+  }
+  const tiers = [];
+  if (patch) tiers.push({ level: "patch", version: patch });
+  if (minor) tiers.push({ level: "minor", version: minor });
+  if (major) tiers.push({ level: "major", version: major });
   const pl = parseSemver(latest);
-  if (!pc || !pl) return "patch";
-  if (pl[0] !== pc[0]) return "major";
-  if (pl[1] !== pc[1]) return "minor";
-  return "patch";
+  if (!tiers.length && pl && semverCmp(latest, current) > 0) {
+    const level = pl[0] !== pc[0] ? "major" : pl[1] !== pc[1] ? "minor" : "patch";
+    tiers.push({ level, version: latest });
+  }
+  return tiers;
 }
 var SEVERITY_BY_LEVEL = {
   major: import_node.DiagnosticSeverity.Warning,
@@ -9410,21 +9428,27 @@ async function validate(uri) {
   if (!fresh || fresh.version !== version) return;
   const findings = [];
   for (const site of sites) {
-    const latest = metaByName.get(site.name)?.latest;
-    if (!latest) continue;
+    const meta = metaByName.get(site.name);
+    if (!meta?.latest) continue;
     const bare = site.current.replace(/^[\^~]/, "");
-    if (semverGt(latest, bare)) {
-      findings.push({ ...site, latest });
-    }
+    const pool = meta.versions.length ? meta.versions : [meta.latest];
+    const tiers = tierUpdates(pool, bare, meta.latest);
+    if (!tiers.length) continue;
+    findings.push({
+      ...site,
+      latest: tiers[tiers.length - 1].version,
+      tiers
+    });
   }
   findingsByUri.set(uri, findings);
   const diagnostics = findings.map((f) => {
     const bare = f.current.replace(/^[\^~]/, "");
-    const level = bumpLevel(bare, f.latest);
-    const message = messageStyle === "level" ? level : messageStyle === "compact" ? `\u2192 ${f.latest} (${level})` : `${f.name}: ${bare} \u2192 ${f.latest} (${level})`;
+    const highest = f.tiers[f.tiers.length - 1];
+    const list = f.tiers.map((t) => `${t.version} (${t.level})`).join(" | ");
+    const message = messageStyle === "level" ? highest.level : messageStyle === "compact" ? `\u2192 ${list}` : `${f.name}: ${bare} \u2192 ${list}`;
     return {
       range: f.range,
-      severity: SEVERITY_BY_LEVEL[level],
+      severity: SEVERITY_BY_LEVEL[highest.level],
       source: "package-bump",
       message,
       data: { name: f.name, latest: f.latest }
@@ -9494,9 +9518,9 @@ async function validate(uri) {
   vulnFixesByUri.set(uri, vulnFixes);
   connection.sendDiagnostics({ uri, diagnostics });
 }
-function bumpEdit(f) {
+function bumpEdit(f, version = f.latest) {
   const prefix = /^[\^~]/.exec(f.current)?.[0] ?? "";
-  return { range: f.range, newText: `${prefix}${f.latest}` };
+  return { range: f.range, newText: `${prefix}${version}` };
 }
 connection.onCodeAction((params) => {
   const uri = params.textDocument.uri;
@@ -9505,13 +9529,15 @@ connection.onCodeAction((params) => {
   if (!findings.length && !vulnFixes.length) return [];
   const actions = [];
   const overlapsCursor = (f) => f.range.start.line <= params.range.end.line && f.range.end.line >= params.range.start.line;
-  for (const f of vulnFixes.filter(overlapsCursor)) {
+  const fixLabel = (f) => f.advisoryCount === 1 ? "fixes the vulnerability" : `fixes all ${f.advisoryCount} vulnerabilities`;
+  const vulnInRange = vulnFixes.filter(overlapsCursor);
+  for (const f of vulnInRange) {
     const shadowedByBump = findings.some(
-      (b) => b.name === f.name && b.range.start.line === f.range.start.line && b.latest === f.latest
+      (b) => b.name === f.name && b.range.start.line === f.range.start.line && b.tiers.some((t) => t.version === f.latest)
     );
     if (shadowedByBump) continue;
     actions.push({
-      title: f.advisoryCount === 1 ? `Update ${f.name} to ${f.latest} (fixes the vulnerability)` : `Update ${f.name} to ${f.latest} (fixes all ${f.advisoryCount} vulnerabilities)`,
+      title: `Update ${f.name} to ${f.latest} (${fixLabel(f)})`,
       kind: import_node.CodeActionKind.QuickFix,
       diagnostics: params.context.diagnostics.filter(
         (d) => d.source === "package-bump" && d.code !== void 0 && d.range.start.line === f.range.start.line && d.range.start.character === f.range.start.character
@@ -9521,20 +9547,26 @@ connection.onCodeAction((params) => {
   }
   const inRange = findings.filter(overlapsCursor);
   for (const f of inRange) {
-    actions.push({
-      title: `Update ${f.name} to ${f.latest}`,
-      kind: import_node.CodeActionKind.QuickFix,
-      diagnostics: params.context.diagnostics.filter(
-        (d) => d.source === "package-bump" && d.data?.name === f.name && d.range.start.line === f.range.start.line && d.range.start.character === f.range.start.character
-      ),
-      edit: { changes: { [uri]: [bumpEdit(f)] } }
-    });
+    const attached = params.context.diagnostics.filter(
+      (d) => d.source === "package-bump" && d.data?.name === f.name && d.range.start.line === f.range.start.line && d.range.start.character === f.range.start.character
+    );
+    const vulnFix = vulnInRange.find(
+      (v) => v.name === f.name && v.range.start.line === f.range.start.line
+    );
+    for (const t of [...f.tiers].reverse()) {
+      actions.push({
+        title: vulnFix && vulnFix.latest === t.version ? `Update ${f.name} to ${t.version} (${t.level}, ${fixLabel(vulnFix)})` : `Update ${f.name} to ${t.version} (${t.level})`,
+        kind: import_node.CodeActionKind.QuickFix,
+        diagnostics: attached,
+        edit: { changes: { [uri]: [bumpEdit(f, t.version)] } }
+      });
+    }
   }
   if (findings.length > 1) {
     actions.push({
       title: `Update all ${findings.length} outdated packages`,
       kind: import_node.CodeActionKind.SourceFixAll,
-      edit: { changes: { [uri]: findings.map(bumpEdit) } }
+      edit: { changes: { [uri]: findings.map((f) => bumpEdit(f)) } }
     });
   }
   return actions;

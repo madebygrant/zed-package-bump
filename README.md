@@ -5,10 +5,10 @@ Flags outdated npm packages in `package.json` and adds code actions to bump the 
 Open a `package.json` and outdated packages get underlined with a message like:
 
 ```
-react: 18.3.1 → 19.1.0 (major)
+react: 18.3.1 → 18.3.4 (patch) | 18.4.0 (minor) | 19.1.0 (major)
 ```
 
-The severity matches the size of the update: major = warning, minor = info, patch = hint.
+Every available step is listed — the newest patch, minor, and major above your current version (only tiers that exist are shown). The severity matches the biggest available update: major = warning, minor = info, patch = hint.
 
 Packages with known security vulnerabilities get a second diagnostic, checked against the npm advisory database (the same data `npm audit` uses):
 
@@ -20,8 +20,8 @@ High and critical advisories show as errors, with a clickable link to the GitHub
 
 Put the cursor on a package line and press `cmd-.`:
 
-- **Update `<name>` to `<latest>`** — updates that package, keeping your `^` or `~` prefix.
-- **Update all N outdated packages** — updates the whole file at once.
+- **Update `<name>` to `<version>` (patch/minor/major)** — one action per available tier, keeping your `^` or `~` prefix.
+- **Update all N outdated packages** — updates the whole file to the newest versions at once.
 
 Version ranges the extension can't safely rewrite (`workspace:`, `file:`, `*`, `>=`, etc.) are ignored.
 
@@ -49,7 +49,7 @@ If a project's `.zed/settings.json` sets a `language_servers` allowlist for JSON
 
 ## Settings
 
-`message_style` picks the diagnostic format. Default is `"complete"` (`eslint: 9.39.4 → 10.8.1 (major)`); `"compact"` drops the name and current version, `"level"` is just `major`/`minor`/`patch`.
+`message_style` picks the diagnostic format. Default is `"compact"` (`→ 10.8.1 (major)`); `"complete"` adds the name and current version (`eslint: 9.39.4 → 10.8.1 (major)`), `"level"` is just `major`/`minor`/`patch`.
 
 Vulnerability messages follow the same setting, marked with `⚠`: compact is `⚠ 5 vulnerabilities (high)`, level is `⚠ high`.
 
@@ -60,7 +60,7 @@ Vulnerability messages follow the same setting, marked with `⚠`: compact is `�
   "lsp": {
     "package-bump-lsp": {
       "settings": {
-        "message_style": "compact",
+        "message_style": "complete",
         "check_vulnerabilities": true
       }
     }
