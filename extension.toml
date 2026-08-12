@@ -1,0 +1,11 @@
+id = "package-bump"
+name = "Package Bump"
+version = "0.1.0"
+schema_version = 1
+authors = ["Grant Deelstra <coderonin@duck.com>"]
+description = "Outdated npm dependency diagnostics with click-to-update code actions for package.json."
+repository = "https://github.com/madebygrant/zed-package-bump"
+
+[language_servers.package-bump-lsp]
+name = "Package Bump LSP"
+languages = ["JSON", "JSONC"]

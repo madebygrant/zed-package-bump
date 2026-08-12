@@ -1,0 +1,20 @@
+# Rust
+target/
+*.wasm
+
+# Zed extension build output
+grammars/
+extension.wasm
+
+# Node / LSP
+node_modules/
+lsp/dist/
+*.tsbuildinfo
+
+# Editor / OS
+.DS_Store
+.idea/
+.vscode/
+
+# Logs
+*.log

@@ -1,0 +1,45 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: pnpm/action-setup@v4
+        with:
+          version: 10
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: pnpm
+          cache-dependency-path: lsp/pnpm-lock.yaml
+
+      - name: Install
+        run: pnpm --dir lsp install --frozen-lockfile
+
+      - name: Type-check
+        run: pnpm --dir lsp type-check
+
+      - name: Build bundle
+        run: pnpm --dir lsp build
+
+      # committed bundle is embedded into the wasm via include_str! —
+      # it must always match what lsp/src builds
+      - name: Verify committed bundle is up to date
+        run: |
+          git diff --exit-code server/server.js || {
+            echo '::error::server/server.js is stale — run `pnpm --dir lsp build` and commit the result'
+            exit 1
+          }
+
+      - name: Rust wasm shim compiles
+        run: |
+          rustup target add wasm32-wasip2
+          cargo check --target wasm32-wasip2
