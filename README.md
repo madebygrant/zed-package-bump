@@ -10,6 +10,14 @@ react: 18.3.1 → 19.1.0 (major)
 
 The severity matches the size of the update: major = warning, minor = info, patch = hint.
 
+Packages with known security vulnerabilities get a second diagnostic, checked against the npm advisory database (the same data `npm audit` uses):
+
+```
+lodash 4.17.20: 5 vulnerabilities (worst: high, fix: 4.18.0) — Command Injection in lodash
+```
+
+High and critical advisories show as errors, with a clickable link to the GitHub advisory. `fix:` names the smallest stable version that clears every advisory, and `cmd-.` offers **Update `<name>` to `<version>` (fixes all N vulnerabilities)** — useful when the safe version is closer than latest. Note this checks the version written in `package.json`, not what's actually installed in `node_modules`.
+
 Put the cursor on a package line and press `cmd-.`:
 
 - **Update `<name>` to `<latest>`** — updates that package, keeping your `^` or `~` prefix.
@@ -43,11 +51,18 @@ If a project's `.zed/settings.json` sets a `language_servers` allowlist for JSON
 
 `message_style` picks the diagnostic format. Default is `"complete"` (`eslint: 9.39.4 → 10.8.1 (major)`); `"compact"` drops the name and current version, `"level"` is just `major`/`minor`/`patch`.
 
+Vulnerability messages follow the same setting, marked with `⚠`: compact is `⚠ 5 vulnerabilities (high)`, level is `⚠ high`.
+
+`check_vulnerabilities` turns the security check off when set to `false` (default `true`).
+
 ```jsonc
 {
   "lsp": {
     "package-bump-lsp": {
-      "settings": { "message_style": "compact" }
+      "settings": {
+        "message_style": "compact",
+        "check_vulnerabilities": true
+      }
     }
   }
 }
@@ -58,6 +73,8 @@ If a project's `.zed/settings.json` sets a `language_servers` allowlist for JSON
 `src/lib.rs` is a Rust wasm shim. It embeds the bundled server (`server/server.js`) at compile time via `include_str!`, writes it to the extension work dir on launch, and runs it with Zed's managed Node.
 
 The server reads `dist-tags.latest` from the npm registry (abbreviated metadata, cached in memory for 5 minutes). All four dependency sections are scanned, and a package listed in more than one section is flagged in each. Prereleases compare per semver, so `^1.0.0-rc.1` is flagged once `1.0.0` ships.
+
+Vulnerabilities come from the registry's bulk advisories endpoint (`/-/npm/v1/security/advisories/bulk`), a few POSTs per file, cached for an hour per `name@version`. Suggested fix versions are themselves audited before being shown — a candidate that turns out to carry its own advisories is skipped for the next clean one. The declared version (range prefix stripped) is what gets checked — lockfile-aware checking of actually-installed versions would be a separate feature.
 
 After editing `lsp/src/`, rebuild with `pnpm --dir lsp build`, then Zed → Extensions → Package Bump → **Rebuild** and reopen the file. LSP logs are under `dev: open language server logs`.
 

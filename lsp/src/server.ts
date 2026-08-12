@@ -16,8 +16,12 @@ const connection = createConnection(ProposedFeatures.all);
 const documents = new TextDocuments(TextDocument);
 
 const REGISTRY_URL = 'https://registry.npmjs.org';
+const AUDIT_URL = `${REGISTRY_URL}/-/npm/v1/security/advisories/bulk`;
 const CACHE_TTL_MS = 5 * 60 * 1000;
+/* advisories change slowly; cache longer than dist-tags */
+const AUDIT_TTL_MS = 60 * 60 * 1000;
 const MAX_CONCURRENT = 8;
+const MAX_META_CACHE = 500;
 
 const DEP_SECTIONS = [
   'dependencies',
@@ -39,22 +43,30 @@ interface DepFinding {
 
 interface CacheEntry {
   latest: string | null;
+  /* every published version, ascending — used to find vulnerability fixes */
+  versions: string[];
   ts: number;
 }
 
-const latestCache = new Map<string, CacheEntry>();
+const metaCache = new Map<string, CacheEntry>();
 
 /* complete: "eslint: 9.39.4 → 10.8.1 (major)"
    compact:  "→ 10.8.1 (major)"
    level:    "major" */
 type MessageStyle = 'complete' | 'compact' | 'level';
 let messageStyle: MessageStyle = 'complete';
+let checkVulnerabilities = true;
 
 function applySettings(settings: unknown): void {
-  const style = (settings as { message_style?: string } | undefined)
-    ?.message_style;
+  const s = settings as
+    | { message_style?: string; check_vulnerabilities?: boolean }
+    | undefined;
+  const style = s?.message_style;
   if (style === 'complete' || style === 'compact' || style === 'level') {
     messageStyle = style;
+  }
+  if (typeof s?.check_vulnerabilities === 'boolean') {
+    checkVulnerabilities = s.check_vulnerabilities;
   }
 }
 
@@ -91,14 +103,63 @@ function comparePre(a: string[] | null, b: string[] | null): number {
   return 0;
 }
 
-function semverGt(a: string, b: string): boolean {
+function semverCmp(a: string, b: string): number {
   const pa = parseSemver(a);
   const pb = parseSemver(b);
-  if (!pa || !pb) return false;
+  if (!pa || !pb) return 0;
   for (let i = 0; i < 3; i++) {
-    if (pa[i] !== pb[i]) return (pa[i] as number) > (pb[i] as number);
+    if (pa[i] !== pb[i]) return (pa[i] as number) - (pb[i] as number);
   }
-  return comparePre(pa[3], pb[3]) > 0;
+  return comparePre(pa[3], pb[3]);
+}
+
+function semverGt(a: string, b: string): boolean {
+  return parseSemver(a) !== null && parseSemver(b) !== null
+    ? semverCmp(a, b) > 0
+    : false;
+}
+
+/* npm advisory ranges: comparators AND-ed by spaces, alternatives OR-ed
+   by ||, e.g. ">=4.0.0 <4.17.21", "<1.2.3 || >=2.0.0 <2.1.0", "*" */
+function parseComparator(c: string): { op: string; v: string } | null {
+  if (c === '*') return { op: '*', v: '' };
+  const m = /^(<=|>=|<|>|=)?(.+)$/.exec(c);
+  return m && parseSemver(m[2]) ? { op: m[1] ?? '=', v: m[2] } : null;
+}
+
+function rangeParseable(range: string): boolean {
+  return range.split('||').every((alt) => {
+    const comparators = alt.trim().split(/\s+/).filter(Boolean);
+    return (
+      comparators.length > 0 &&
+      comparators.every((c) => parseComparator(c) !== null)
+    );
+  });
+}
+
+function satisfiesRange(version: string, range: string): boolean {
+  return range.split('||').some((alt) => {
+    const comparators = alt.trim().split(/\s+/).filter(Boolean);
+    if (!comparators.length) return false;
+    return comparators.every((c) => {
+      const parsed = parseComparator(c);
+      if (!parsed) return false;
+      if (parsed.op === '*') return true;
+      const cmp = semverCmp(version, parsed.v);
+      switch (parsed.op) {
+        case '<':
+          return cmp < 0;
+        case '<=':
+          return cmp <= 0;
+        case '>':
+          return cmp > 0;
+        case '>=':
+          return cmp >= 0;
+        default:
+          return cmp === 0;
+      }
+    });
+  });
 }
 
 type BumpLevel = 'major' | 'minor' | 'patch';
@@ -123,11 +184,12 @@ const SEVERITY_BY_LEVEL: Record<BumpLevel, DiagnosticSeverity> = {
 
 // ---------- registry ----------
 
-async function fetchLatest(name: string): Promise<string | null> {
-  const cached = latestCache.get(name);
-  if (cached && Date.now() - cached.ts < CACHE_TTL_MS) return cached.latest;
+async function fetchMeta(name: string): Promise<CacheEntry> {
+  const cached = metaCache.get(name);
+  if (cached && Date.now() - cached.ts < CACHE_TTL_MS) return cached;
 
   let latest: string | null = null;
+  let versions: string[] = [];
   try {
     const res = await fetch(
       `${REGISTRY_URL}/${encodeURIComponent(name).replace('%40', '@')}`,
@@ -142,14 +204,131 @@ async function fetchLatest(name: string): Promise<string | null> {
     if (res.ok) {
       const body = (await res.json()) as {
         'dist-tags'?: Record<string, string>;
+        versions?: Record<string, unknown>;
       };
       latest = body['dist-tags']?.latest ?? null;
+      versions = Object.keys(body.versions ?? {})
+        .filter((v) => parseSemver(v) !== null)
+        .sort(semverCmp);
     }
   } catch {
     /* network failure → no diagnostic, retry after TTL */
   }
-  latestCache.set(name, { latest, ts: Date.now() });
-  return latest;
+  const entry = { latest, versions, ts: Date.now() };
+  /* version lists can run to thousands of entries (@types/*) — evict the
+     oldest insertions rather than grow without bound */
+  if (metaCache.size >= MAX_META_CACHE) {
+    for (const key of metaCache.keys()) {
+      if (metaCache.size < MAX_META_CACHE) break;
+      metaCache.delete(key);
+    }
+  }
+  metaCache.set(name, entry);
+  return entry;
+}
+
+/* smallest stable version above `current` that no advisory range matches.
+   A range we can't parse means we can't prove any version safe — fail
+   closed and suggest nothing rather than guess */
+function firstSafeVersion(
+  versions: string[],
+  current: string,
+  advisories: Advisory[],
+): string | null {
+  if (advisories.some((a) => !rangeParseable(a.vulnerable_versions))) {
+    return null;
+  }
+  for (const v of versions) {
+    const p = parseSemver(v);
+    if (!p || p[3]) continue;
+    if (semverCmp(v, current) <= 0) continue;
+    if (advisories.every((a) => !satisfiesRange(v, a.vulnerable_versions))) {
+      return v;
+    }
+  }
+  return null;
+}
+
+// ---------- vulnerability audit ----------
+
+interface Advisory {
+  id: number;
+  url: string;
+  title: string;
+  severity: 'low' | 'moderate' | 'high' | 'critical';
+  vulnerable_versions: string;
+}
+
+const SEVERITY_RANK: Record<Advisory['severity'], number> = {
+  low: 0,
+  moderate: 1,
+  high: 2,
+  critical: 3,
+};
+
+interface AuditEntry {
+  advisories: Advisory[];
+  ts: number;
+}
+
+/* keyed by `${name}@${version}` */
+const auditCache = new Map<string, AuditEntry>();
+
+/* npm's bulk audit endpoint (the one `npm audit` uses): POST
+   {name: [version]} → {name: [advisories matching that version]}.
+   Matching is server-side, but the response is keyed by name only, so a
+   name can appear at most once per request — names with several distinct
+   versions in the file go out in separate rounds (slot k carries each
+   name's k-th version) to keep the attribution unambiguous */
+async function fetchAdvisories(
+  pairs: Array<{ name: string; version: string }>,
+): Promise<void> {
+  const now = Date.now();
+  const byName = new Map<string, string[]>();
+  for (const { name, version } of pairs) {
+    const cached = auditCache.get(`${name}@${version}`);
+    if (cached && now - cached.ts < AUDIT_TTL_MS) continue;
+    let versions = byName.get(name);
+    if (!versions) byName.set(name, (versions = []));
+    if (!versions.includes(version)) versions.push(version);
+  }
+  if (byName.size === 0) return;
+
+  const rounds = Math.max(...[...byName.values()].map((v) => v.length));
+  const requests = [];
+  for (let slot = 0; slot < rounds; slot++) {
+    const body: Record<string, string[]> = {};
+    for (const [name, versions] of byName) {
+      if (versions[slot] !== undefined) body[name] = [versions[slot]];
+    }
+    requests.push(
+      (async () => {
+        try {
+          const res = await fetch(AUDIT_URL, {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify(body),
+            signal: AbortSignal.timeout(15_000),
+          });
+          if (!res.ok) return;
+          const result = (await res.json()) as Record<string, Advisory[]>;
+          for (const name of Object.keys(body)) {
+            auditCache.set(`${name}@${body[name][0]}`, {
+              advisories: result[name] ?? [],
+              ts: Date.now(),
+            });
+          }
+        } catch {
+          /* network failure → no vuln diagnostics this round, retry after TTL */
+        }
+      })(),
+    );
+  }
+  await Promise.all(requests);
+}
+
+function advisoriesFor(name: string, version: string): Advisory[] {
+  return auditCache.get(`${name}@${version}`)?.advisories ?? [];
 }
 
 async function mapLimit<T, R>(
@@ -233,6 +412,11 @@ function findVersionRanges(
 const pendingValidation = new Map<string, NodeJS.Timeout>();
 /* findings per uri, consumed by code actions */
 const findingsByUri = new Map<string, DepFinding[]>();
+/* vulnerable deps with a known safe version, per uri; `latest` holds the fix */
+interface VulnFix extends DepFinding {
+  advisoryCount: number;
+}
+const vulnFixesByUri = new Map<string, VulnFix[]>();
 
 function scheduleValidation(doc: TextDocument): void {
   const existing = pendingValidation.get(doc.uri);
@@ -255,10 +439,17 @@ async function validate(uri: string): Promise<void> {
   const sites = findVersionRanges(doc, deps);
 
   const uniqueNames = [...new Set(sites.map((s) => s.name))];
-  const latestByName = new Map<string, string | null>();
-  await mapLimit(uniqueNames, MAX_CONCURRENT, async (name) => {
-    latestByName.set(name, await fetchLatest(name));
-  });
+  const metaByName = new Map<string, CacheEntry>();
+  const auditPairs = sites.map((s) => ({
+    name: s.name,
+    version: s.current.replace(/^[\^~]/, ''),
+  }));
+  await Promise.all([
+    mapLimit(uniqueNames, MAX_CONCURRENT, async (name) => {
+      metaByName.set(name, await fetchMeta(name));
+    }),
+    checkVulnerabilities ? fetchAdvisories(auditPairs) : Promise.resolve(),
+  ]);
 
   /* document changed while fetching → stale ranges, rerun happens via debounce */
   const fresh = documents.get(uri);
@@ -266,7 +457,7 @@ async function validate(uri: string): Promise<void> {
 
   const findings: DepFinding[] = [];
   for (const site of sites) {
-    const latest = latestByName.get(site.name);
+    const latest = metaByName.get(site.name)?.latest;
     if (!latest) continue;
     const bare = site.current.replace(/^[\^~]/, '');
     if (semverGt(latest, bare)) {
@@ -293,6 +484,97 @@ async function validate(uri: string): Promise<void> {
     };
   });
 
+  const vulnFixes: VulnFix[] = [];
+  if (checkVulnerabilities) {
+    interface VulnSite {
+      site: (typeof sites)[number];
+      bare: string;
+      /* advisories matching the current version — drives the diagnostic */
+      matched: Advisory[];
+      /* every advisory seen while searching, keyed by id — drives the fix */
+      known: Map<number, Advisory>;
+      fix: string | null;
+      verified: boolean;
+    }
+    const vulnSites: VulnSite[] = [];
+    for (const site of sites) {
+      const bare = site.current.replace(/^[\^~]/, '');
+      const matched = advisoriesFor(site.name, bare);
+      if (!matched.length) continue;
+      vulnSites.push({
+        site,
+        bare,
+        matched,
+        known: new Map(matched.map((a) => [a.id, a])),
+        fix: firstSafeVersion(
+          metaByName.get(site.name)?.versions ?? [],
+          bare,
+          matched,
+        ),
+        verified: false,
+      });
+    }
+
+    /* the candidate was chosen against the CURRENT version's advisories;
+       an advisory introduced in a later range is invisible until the
+       candidate itself is audited. Audit candidates (one bulk POST per
+       round, cached) and walk upward until one comes back clean */
+    for (let round = 0; round < 3; round++) {
+      const pending = vulnSites.filter((v) => v.fix && !v.verified);
+      if (!pending.length) break;
+      await fetchAdvisories(
+        pending.map((v) => ({ name: v.site.name, version: v.fix as string })),
+      );
+      for (const v of pending) {
+        const extra = advisoriesFor(v.site.name, v.fix as string);
+        if (!extra.length) {
+          v.verified = true;
+          continue;
+        }
+        for (const a of extra) v.known.set(a.id, a);
+        v.fix = firstSafeVersion(
+          metaByName.get(v.site.name)?.versions ?? [],
+          v.bare,
+          [...v.known.values()],
+        );
+      }
+    }
+
+    for (const { site, bare, matched, fix, verified } of vulnSites) {
+      const safe = verified ? fix : null;
+      const worst = matched.reduce((a, b) =>
+        SEVERITY_RANK[b.severity] > SEVERITY_RANK[a.severity] ? b : a,
+      );
+      const n = matched.length;
+      if (safe) vulnFixes.push({ ...site, latest: safe, advisoryCount: n });
+      const count = `${n} ${n === 1 ? 'vulnerability' : 'vulnerabilities'}`;
+      const fixNote = safe ? `, fix: ${safe}` : '';
+      const message =
+        messageStyle === 'level'
+          ? `⚠ ${worst.severity}`
+          : messageStyle === 'compact'
+            ? `⚠ ${count} (${worst.severity}${fixNote})`
+            : `${site.name} ${bare}: ${count} (worst: ${worst.severity}${fixNote}) — ${worst.title}`;
+      diagnostics.push({
+        range: site.range,
+        severity:
+          SEVERITY_RANK[worst.severity] >= SEVERITY_RANK.high
+            ? DiagnosticSeverity.Error
+            : worst.severity === 'moderate'
+              ? DiagnosticSeverity.Warning
+              : DiagnosticSeverity.Information,
+        source: 'package-bump',
+        message,
+        code: worst.url.split('/').pop(),
+        codeDescription: { href: worst.url },
+      });
+    }
+  }
+  /* the fix-verification rounds awaited network again — re-check staleness */
+  if (documents.get(uri)?.version !== version) return;
+
+  vulnFixesByUri.set(uri, vulnFixes);
+
   connection.sendDiagnostics({ uri, diagnostics });
 }
 
@@ -305,16 +587,40 @@ function bumpEdit(f: DepFinding): TextEdit {
 
 connection.onCodeAction((params) => {
   const uri = params.textDocument.uri;
-  const findings = findingsByUri.get(uri);
-  if (!findings?.length) return [];
+  const findings = findingsByUri.get(uri) ?? [];
+  const vulnFixes = vulnFixesByUri.get(uri) ?? [];
+  if (!findings.length && !vulnFixes.length) return [];
 
   const actions: CodeAction[] = [];
 
-  const inRange = findings.filter(
-    (f) =>
-      f.range.start.line <= params.range.end.line &&
-      f.range.end.line >= params.range.start.line,
-  );
+  const overlapsCursor = (f: DepFinding) =>
+    f.range.start.line <= params.range.end.line &&
+    f.range.end.line >= params.range.start.line;
+
+  /* a vuln fix to the same version as latest would duplicate the bump action */
+  for (const f of vulnFixes.filter(overlapsCursor)) {
+    const shadowedByBump = findings.some(
+      (b) => b.name === f.name && b.range.start.line === f.range.start.line && b.latest === f.latest,
+    );
+    if (shadowedByBump) continue;
+    actions.push({
+      title:
+        f.advisoryCount === 1
+          ? `Update ${f.name} to ${f.latest} (fixes the vulnerability)`
+          : `Update ${f.name} to ${f.latest} (fixes all ${f.advisoryCount} vulnerabilities)`,
+      kind: CodeActionKind.QuickFix,
+      diagnostics: params.context.diagnostics.filter(
+        (d) =>
+          d.source === 'package-bump' &&
+          d.code !== undefined &&
+          d.range.start.line === f.range.start.line &&
+          d.range.start.character === f.range.start.character,
+      ),
+      edit: { changes: { [uri]: [bumpEdit(f)] } },
+    });
+  }
+
+  const inRange = findings.filter(overlapsCursor);
 
   for (const f of inRange) {
     actions.push({
@@ -365,6 +671,7 @@ documents.onDidOpen((e) => scheduleValidation(e.document));
 documents.onDidChangeContent((e) => scheduleValidation(e.document));
 documents.onDidClose((e) => {
   findingsByUri.delete(e.document.uri);
+  vulnFixesByUri.delete(e.document.uri);
   connection.sendDiagnostics({ uri: e.document.uri, diagnostics: [] });
 });
 
