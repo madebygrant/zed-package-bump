@@ -70,10 +70,10 @@ const metaCache = new Map<string, CacheEntry>();
 /* stand-in when a package has no cache entry — read-only by convention */
 const NO_DEPRECATIONS: ReadonlyMap<string, string> = new Map();
 
-/* complete: "eslint: 9.39.4 → 10.8.1 (major)"
+/* full:     "eslint: 9.39.4 → 10.8.1 (major) — updated 2026-08-12"
    compact:  "→ 10.8.1 (major)"
-   level:    "major" */
-type MessageStyle = 'complete' | 'compact' | 'level';
+   level:    "minor | major" */
+type MessageStyle = 'full' | 'compact' | 'level';
 let messageStyle: MessageStyle = 'compact';
 let checkVulnerabilities = true;
 /* clients without documentChanges support ignore that form entirely — fall
@@ -85,7 +85,7 @@ function applySettings(settings: unknown): void {
     | { message_style?: string; check_vulnerabilities?: boolean }
     | undefined;
   const style = s?.message_style;
-  if (style === 'complete' || style === 'compact' || style === 'level') {
+  if (style === 'full' || style === 'compact' || style === 'level') {
     messageStyle = style;
   }
   if (typeof s?.check_vulnerabilities === 'boolean') {
@@ -568,12 +568,12 @@ async function validate(uri: string): Promise<void> {
       .join(' | ');
     const modified = metaByName.get(f.name)?.modified;
     const published =
-      modified && messageStyle === 'complete'
+      modified && messageStyle === 'full'
         ? ` — updated ${modified.slice(0, 10)}`
         : '';
     const message =
       messageStyle === 'level'
-        ? highest.level
+        ? f.tiers.map((t) => t.level).join(' | ')
         : messageStyle === 'compact'
           ? `→ ${list}`
           : `${f.name}: ${bare} → ${list}${published}`;
@@ -588,30 +588,22 @@ async function validate(uri: string): Promise<void> {
 
   const withheldBySite = new Map(withheld.map((w) => [w.site, w.tier]));
 
-  /* deprecated versions get their own warning regardless of update status */
+  /* deprecation text per site, emitted below — a site that also has
+     advisories hands its text to the vulnerability diagnostic instead, so
+     one line never carries two competing warnings */
+  const deprecationBySite = new Map<(typeof sites)[number], string>();
   for (const site of sites) {
     const bare = site.current.replace(/^[\^~]/, '');
     const note = metaByName.get(site.name)?.deprecated.get(bare);
     if (note === undefined) continue;
     /* a withheld update on a line that is already flagged deprecated says
-       the same thing twice — fold it in and drop the separate note, which
-       spares the line a third diagnostic competing for the inline slot */
+       the same thing twice — fold it in and drop the separate note */
     const tier = withheldBySite.get(site);
     withheldBySite.delete(site);
     const also = tier
       ? ` (${tier.version} also deprecated — no update offered)`
       : '';
-    diagnostics.push({
-      range: site.range,
-      severity: DiagnosticSeverity.Warning,
-      source: 'package-bump',
-      message:
-        messageStyle === 'level'
-          ? '⛔ deprecated'
-          : messageStyle === 'compact'
-            ? `⛔ deprecated: ${note}${also}`
-            : `${site.name} ${bare} is deprecated: ${note}${also}`,
-    });
+    deprecationBySite.set(site, `${note}${also}`);
   }
 
   /* informational: there is nothing to click, the point is that the
@@ -624,10 +616,10 @@ async function validate(uri: string): Promise<void> {
       source: 'package-bump',
       message:
         messageStyle === 'level'
-          ? '⛔ no update'
+          ? '⊘ no update'
           : messageStyle === 'compact'
-            ? `⛔ ${tier.version} (${tier.level}) deprecated — no update offered`
-            : `${site.name}: ${bare} → ${tier.version} (${tier.level}) is deprecated — no update offered`,
+            ? `⊘ ${tier.version} (${tier.level}) deprecated — no update offered`
+            : `⊘ ${site.name}: ${bare} → ${tier.version} (${tier.level}) is deprecated — no update offered`,
     });
   }
 
@@ -700,20 +692,31 @@ async function validate(uri: string): Promise<void> {
       if (safe) vulnFixes.push({ ...site, latest: safe, advisoryCount: n });
       const count = `${n} ${n === 1 ? 'vulnerability' : 'vulnerabilities'}`;
       const fixNote = safe ? `, fix: ${safe}` : '';
+      /* a deprecated package with advisories reads as one problem, not two:
+         both markers, the advisory's severity, and the maintainer's note */
+      const deprecation = deprecationBySite.get(site);
+      deprecationBySite.delete(site);
+      const mark = deprecation ? '⚠ ⊘' : '⚠';
+      const tail = deprecation ? `; deprecated: ${deprecation}` : '';
       const message =
         messageStyle === 'level'
-          ? `⚠ ${worst.severity}`
+          ? `${mark} ${worst.severity}`
           : messageStyle === 'compact'
-            ? `⚠ ${count} (${worst.severity}${fixNote})`
-            : `${site.name} ${bare}: ${count} (worst: ${worst.severity}${fixNote}) — ${worst.title}`;
+            ? `${mark} ${count} (${worst.severity}${fixNote})${tail}`
+            : `${mark} ${site.name} ${bare}: ${count} (worst: ${worst.severity}${fixNote}) — ${worst.title}${tail}`;
+      const vulnSeverity =
+        SEVERITY_RANK[worst.severity] >= SEVERITY_RANK.high
+          ? DiagnosticSeverity.Error
+          : worst.severity === 'moderate'
+            ? DiagnosticSeverity.Warning
+            : DiagnosticSeverity.Information;
       diagnostics.push({
         range: site.range,
+        /* a low advisory must not drag a deprecation below Warning */
         severity:
-          SEVERITY_RANK[worst.severity] >= SEVERITY_RANK.high
-            ? DiagnosticSeverity.Error
-            : worst.severity === 'moderate'
-              ? DiagnosticSeverity.Warning
-              : DiagnosticSeverity.Information,
+          deprecation && vulnSeverity > DiagnosticSeverity.Warning
+            ? DiagnosticSeverity.Warning
+            : vulnSeverity,
         source: 'package-bump',
         message,
         code: worst.url.split('/').pop(),
@@ -721,6 +724,23 @@ async function validate(uri: string): Promise<void> {
       });
     }
   }
+
+  /* deprecations with no advisory to ride along with */
+  for (const [site, text] of deprecationBySite) {
+    const bare = site.current.replace(/^[\^~]/, '');
+    diagnostics.push({
+      range: site.range,
+      severity: DiagnosticSeverity.Warning,
+      source: 'package-bump',
+      message:
+        messageStyle === 'level'
+          ? '⊘ deprecated'
+          : messageStyle === 'compact'
+            ? `⊘ deprecated: ${text}`
+            : `⊘ ${site.name} ${bare} is deprecated: ${text}`,
+    });
+  }
+
   /* the fix-verification rounds awaited network again — re-check staleness */
   if (documents.get(uri)?.version !== version) return;
 

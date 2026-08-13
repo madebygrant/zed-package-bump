@@ -9127,7 +9127,7 @@ var supportsDocumentChanges = false;
 function applySettings(settings) {
   const s = settings;
   const style = s?.message_style;
-  if (style === "complete" || style === "compact" || style === "level") {
+  if (style === "full" || style === "compact" || style === "level") {
     messageStyle = style;
   }
   if (typeof s?.check_vulnerabilities === "boolean") {
@@ -9467,8 +9467,8 @@ async function validate(uri) {
     const highest = f.tiers[f.tiers.length - 1];
     const list = f.tiers.map((t) => `${t.version} (${t.level})`).join(" | ");
     const modified = metaByName.get(f.name)?.modified;
-    const published = modified && messageStyle === "complete" ? ` \u2014 updated ${modified.slice(0, 10)}` : "";
-    const message = messageStyle === "level" ? highest.level : messageStyle === "compact" ? `\u2192 ${list}` : `${f.name}: ${bare} \u2192 ${list}${published}`;
+    const published = modified && messageStyle === "full" ? ` \u2014 updated ${modified.slice(0, 10)}` : "";
+    const message = messageStyle === "level" ? f.tiers.map((t) => t.level).join(" | ") : messageStyle === "compact" ? `\u2192 ${list}` : `${f.name}: ${bare} \u2192 ${list}${published}`;
     return {
       range: f.range,
       severity: SEVERITY_BY_LEVEL[highest.level],
@@ -9478,6 +9478,7 @@ async function validate(uri) {
     };
   });
   const withheldBySite = new Map(withheld.map((w) => [w.site, w.tier]));
+  const deprecationBySite = /* @__PURE__ */ new Map();
   for (const site of sites) {
     const bare = site.current.replace(/^[\^~]/, "");
     const note = metaByName.get(site.name)?.deprecated.get(bare);
@@ -9485,12 +9486,7 @@ async function validate(uri) {
     const tier = withheldBySite.get(site);
     withheldBySite.delete(site);
     const also = tier ? ` (${tier.version} also deprecated \u2014 no update offered)` : "";
-    diagnostics.push({
-      range: site.range,
-      severity: import_node.DiagnosticSeverity.Warning,
-      source: "package-bump",
-      message: messageStyle === "level" ? "\u26D4 deprecated" : messageStyle === "compact" ? `\u26D4 deprecated: ${note}${also}` : `${site.name} ${bare} is deprecated: ${note}${also}`
-    });
+    deprecationBySite.set(site, `${note}${also}`);
   }
   for (const [site, tier] of withheldBySite) {
     const bare = site.current.replace(/^[\^~]/, "");
@@ -9498,7 +9494,7 @@ async function validate(uri) {
       range: site.range,
       severity: import_node.DiagnosticSeverity.Information,
       source: "package-bump",
-      message: messageStyle === "level" ? "\u26D4 no update" : messageStyle === "compact" ? `\u26D4 ${tier.version} (${tier.level}) deprecated \u2014 no update offered` : `${site.name}: ${bare} \u2192 ${tier.version} (${tier.level}) is deprecated \u2014 no update offered`
+      message: messageStyle === "level" ? "\u2298 no update" : messageStyle === "compact" ? `\u2298 ${tier.version} (${tier.level}) deprecated \u2014 no update offered` : `\u2298 ${site.name}: ${bare} \u2192 ${tier.version} (${tier.level}) is deprecated \u2014 no update offered`
     });
   }
   const vulnFixes = [];
@@ -9554,16 +9550,31 @@ async function validate(uri) {
       if (safe) vulnFixes.push({ ...site, latest: safe, advisoryCount: n });
       const count = `${n} ${n === 1 ? "vulnerability" : "vulnerabilities"}`;
       const fixNote = safe ? `, fix: ${safe}` : "";
-      const message = messageStyle === "level" ? `\u26A0 ${worst.severity}` : messageStyle === "compact" ? `\u26A0 ${count} (${worst.severity}${fixNote})` : `${site.name} ${bare}: ${count} (worst: ${worst.severity}${fixNote}) \u2014 ${worst.title}`;
+      const deprecation = deprecationBySite.get(site);
+      deprecationBySite.delete(site);
+      const mark = deprecation ? "\u26A0 \u2298" : "\u26A0";
+      const tail = deprecation ? `; deprecated: ${deprecation}` : "";
+      const message = messageStyle === "level" ? `${mark} ${worst.severity}` : messageStyle === "compact" ? `${mark} ${count} (${worst.severity}${fixNote})${tail}` : `${mark} ${site.name} ${bare}: ${count} (worst: ${worst.severity}${fixNote}) \u2014 ${worst.title}${tail}`;
+      const vulnSeverity = SEVERITY_RANK[worst.severity] >= SEVERITY_RANK.high ? import_node.DiagnosticSeverity.Error : worst.severity === "moderate" ? import_node.DiagnosticSeverity.Warning : import_node.DiagnosticSeverity.Information;
       diagnostics.push({
         range: site.range,
-        severity: SEVERITY_RANK[worst.severity] >= SEVERITY_RANK.high ? import_node.DiagnosticSeverity.Error : worst.severity === "moderate" ? import_node.DiagnosticSeverity.Warning : import_node.DiagnosticSeverity.Information,
+        /* a low advisory must not drag a deprecation below Warning */
+        severity: deprecation && vulnSeverity > import_node.DiagnosticSeverity.Warning ? import_node.DiagnosticSeverity.Warning : vulnSeverity,
         source: "package-bump",
         message,
         code: worst.url.split("/").pop(),
         codeDescription: { href: worst.url }
       });
     }
+  }
+  for (const [site, text] of deprecationBySite) {
+    const bare = site.current.replace(/^[\^~]/, "");
+    diagnostics.push({
+      range: site.range,
+      severity: import_node.DiagnosticSeverity.Warning,
+      source: "package-bump",
+      message: messageStyle === "level" ? "\u2298 deprecated" : messageStyle === "compact" ? `\u2298 deprecated: ${text}` : `\u2298 ${site.name} ${bare} is deprecated: ${text}`
+    });
   }
   if (documents.get(uri)?.version !== version) return;
   vulnFixesByUri.set(uri, vulnFixes);

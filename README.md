@@ -25,7 +25,7 @@ Put the cursor on a package line and press `cmd-.`:
 - **Update `<name>` to `<version>` (patch/minor/major)** — one action per available tier, keeping your `^` or `~` prefix.
 - **Update all N outdated packages** — rewrites every outdated version in the file at once.
 
-![Code action menu on a lodash line, offering the minor update labelled as fixing all 5 vulnerabilities, the patch update, and update all](examples/context-menu.webp)
+![Code action menu on a typescript line, listing the major, minor and patch updates newest first, then update all 8 outdated packages](examples/context-menu.webp)
 
 The newest version leads the menu. A tier that also clears a security advisory says so in its own label instead of adding a separate action.
 
@@ -34,7 +34,7 @@ The newest version leads the menu. A tier that also clears a security advisory s
 Packages with known advisories get a second diagnostic, checked against the npm advisory database (the same data `npm audit` uses):
 
 ```
-lodash 4.17.20: 5 vulnerabilities (worst: high, fix: 4.18.1) — Command Injection in lodash
+⚠ 5 vulnerabilities (high, fix: 4.18.1)
 ```
 
 High and critical advisories show as errors, with a clickable link to the GitHub advisory. `fix:` names the smallest stable, non-deprecated version that clears every advisory, and `cmd-.` offers **Update `<name>` to `<version>` (fixes all N vulnerabilities)** — useful when the safe version is closer than latest.
@@ -46,16 +46,22 @@ This checks the version written in `package.json`, not what's actually installed
 Deprecated packages get a warning carrying the maintainer's message:
 
 ```
-request 2.88.2 is deprecated: request has been deprecated, see https://github.com/request/request/issues/3142
+⊘ deprecated: request has been deprecated, see https://github.com/request/request/issues/3142
 ```
 
 A deprecated version is never offered as an update target, including as a vulnerability fix. When everything newer is deprecated there's nothing to offer, so you get a note:
 
 ```
-some-pkg 1.2.0 → 1.3.0 (minor) is deprecated — no update offered
+⊘ 1.3.0 (minor) deprecated — no update offered
 ```
 
-If your own version is deprecated as well, that note joins the warning: `… is deprecated: <message> (1.3.0 also deprecated — no update offered)`.
+If your own version is deprecated as well, that note joins the warning instead: `⊘ deprecated: <message> (1.3.0 also deprecated — no update offered)`.
+
+A package that is both deprecated and vulnerable is one problem, not two, so it gets a single message carrying both markers and the advisory's severity — red for high and critical:
+
+```
+⚠ ⊘ 16 vulnerabilities (critical, fix: 7.5.21); deprecated: Old versions of tar are not supported…
+```
 
 ## What's skipped
 
@@ -94,7 +100,7 @@ These go in Zed's `settings.json`, or in `.zed/settings.json` to apply to one pr
   "lsp": {
     "package-bump-lsp": {
       "settings": {
-        "message_style": "complete",
+        "message_style": "full",
         "check_vulnerabilities": true
       }
     }
@@ -107,16 +113,16 @@ These go in Zed's `settings.json`, or in `.zed/settings.json` to apply to one pr
 | value                 | example                                                  |
 | --------------------- | -------------------------------------------------------- |
 | `"compact"` (default) | `→ 10.8.1 (major)`                                        |
-| `"complete"`          | `eslint: 9.39.4 → 10.8.1 (major) — updated 2026-08-12`    |
-| `"level"`             | `major`                                                   |
+| `"full"`              | `eslint: 9.39.4 → 10.8.1 (major) — updated 2026-08-12`    |
+| `"level"`             | `patch \| minor \| major`                                 |
 
-Vulnerability and deprecation messages shorten the same way, marked with `⚠` and `⛔` — a vulnerability is `⚠ 5 vulnerabilities (high)` in compact and `⚠ high` in level, a deprecation is `⛔ deprecated: <message>` then `⛔ deprecated`.
+Vulnerability and deprecation messages shorten the same way and keep their `⚠` and `⊘` marker in every style. A vulnerability reads `⚠ 5 vulnerabilities (high)` in compact and `⚠ high` in level; a deprecation reads `⊘ deprecated: <message>` then `⊘ deprecated`.
 
-`"complete"` and `"level"` on the same file (`"compact"` is the screenshot at the top):
+`"full"` and `"level"` on the same file (`"compact"` is the screenshot at the top):
 
-![Complete style, each message prefixed with the package name and current version and ending with the registry update date](examples/complete-mode.webp)
+![Full style, each message prefixed with the package name and current version and ending with the registry update date](examples/full-mode.webp)
 
-![Level style, each message reduced to a single word such as major, minor, or deprecated](examples/level-mode.webp)
+![Level style, each message reduced to the tier words such as patch, minor and major, or deprecated](examples/level-mode.webp)
 
 Zed only shows one message per line inline, so a package with both an update and a warning shows the more severe one. The diagnostics panel lists the rest.
 
