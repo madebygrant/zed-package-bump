@@ -35,7 +35,7 @@ Nothing deprecated is ever suggested as a bump target, vulnerability fixes inclu
 request 2.88.2 → 2.88.3 (patch) is deprecated — no update offered
 ```
 
-Version ranges the extension can't safely rewrite (`workspace:`, `file:`, `*`, `>=`, etc.) are ignored.
+Version ranges the extension can't safely rewrite (`workspace:`, `file:`, `*`, `>=`, etc.) are ignored. So are manifests under `node_modules` — npm overwrites those on the next install.
 
 ## Install
 

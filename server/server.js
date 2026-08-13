@@ -9362,7 +9362,7 @@ async function mapLimit(items, limit, fn) {
   return results;
 }
 function isPackageJson(uri) {
-  return /\/package\.json$/.test(uri);
+  return /\/package\.json$/.test(uri) && !/\/node_modules\//.test(uri);
 }
 function collectDeps(text) {
   const deps = /* @__PURE__ */ new Map();
@@ -9410,6 +9410,7 @@ var pendingValidation = /* @__PURE__ */ new Map();
 var findingsByUri = /* @__PURE__ */ new Map();
 var vulnFixesByUri = /* @__PURE__ */ new Map();
 function scheduleValidation(doc) {
+  if (!isPackageJson(doc.uri)) return;
   const existing = pendingValidation.get(doc.uri);
   if (existing) clearTimeout(existing);
   pendingValidation.set(

@@ -8,4 +8,4 @@ repository = "https://github.com/madebygrant/zed-package-bump"
 
 [language_servers.package-bump-lsp]
 name = "Package Bump LSP"
-languages = ["JSON", "JSONC"]
+languages = ["JSON"]

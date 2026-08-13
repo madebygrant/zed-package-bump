@@ -421,8 +421,11 @@ async function mapLimit<T, R>(
 
 // ---------- package.json analysis ----------
 
+/* installed dependencies carry their own manifests — editing those is
+   pointless (npm overwrites them) and a deep tree would flood the
+   registry with lookups, so only project manifests count */
 function isPackageJson(uri: string): boolean {
-  return /\/package\.json$/.test(uri);
+  return /\/package\.json$/.test(uri) && !/\/node_modules\//.test(uri);
 }
 
 /* name → all ranges seen across sections; a dep can appear in several
@@ -491,6 +494,9 @@ interface VulnFix {
 const vulnFixesByUri = new Map<string, VulnFix[]>();
 
 function scheduleValidation(doc: TextDocument): void {
+  /* Zed attaches the server to every JSON buffer — it can't match on
+     filename — so bail before allocating a timer per keystroke */
+  if (!isPackageJson(doc.uri)) return;
   const existing = pendingValidation.get(doc.uri);
   if (existing) clearTimeout(existing);
   pendingValidation.set(
