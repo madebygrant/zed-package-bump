@@ -16,12 +16,24 @@ Packages with known security vulnerabilities get a second diagnostic, checked ag
 lodash 4.17.20: 5 vulnerabilities (worst: high, fix: 4.18.0) — Command Injection in lodash
 ```
 
-High and critical advisories show as errors, with a clickable link to the GitHub advisory. `fix:` names the smallest stable version that clears every advisory, and `cmd-.` offers **Update `<name>` to `<version>` (fixes all N vulnerabilities)** — useful when the safe version is closer than latest. Note this checks the version written in `package.json`, not what's actually installed in `node_modules`.
+High and critical advisories show as errors, with a clickable link to the GitHub advisory. `fix:` names the smallest stable, non-deprecated version that clears every advisory, and `cmd-.` offers **Update `<name>` to `<version>` (fixes all N vulnerabilities)** — useful when the safe version is closer than latest. Note this checks the version written in `package.json`, not what's actually installed in `node_modules`.
 
 Put the cursor on a package line and press `cmd-.`:
 
 - **Update `<name>` to `<version>` (patch/minor/major)** — one action per available tier, keeping your `^` or `~` prefix.
 - **Update all N outdated packages** — updates the whole file to the newest versions at once.
+
+Deprecated versions get a warning with the maintainer's message:
+
+```
+request 2.88.2 is deprecated: request has been deprecated, see https://github.com/request/request/issues/3142
+```
+
+Nothing deprecated is ever suggested as a bump target, vulnerability fixes included. If everything above your version is deprecated there's no action to offer, so you get a note instead:
+
+```
+request 2.88.2 → 2.88.3 (patch) is deprecated — no update offered
+```
 
 Version ranges the extension can't safely rewrite (`workspace:`, `file:`, `*`, `>=`, etc.) are ignored.
 
@@ -49,9 +61,11 @@ If a project's `.zed/settings.json` sets a `language_servers` allowlist for JSON
 
 ## Settings
 
-`message_style` picks the diagnostic format. Default is `"compact"` (`→ 10.8.1 (major)`); `"complete"` adds the name and current version (`eslint: 9.39.4 → 10.8.1 (major)`), `"level"` is just `major`/`minor`/`patch`.
+`message_style` picks the diagnostic format. Default is `"compact"` (`→ 10.8.1 (major)`); `"complete"` adds the name, current version, and registry update date (`eslint: 9.39.4 → 10.8.1 (major) — updated 2026-08-12`), `"level"` is just `major`/`minor`/`patch`.
 
 Vulnerability messages follow the same setting, marked with `⚠`: compact is `⚠ 5 vulnerabilities (high)`, level is `⚠ high`.
+
+Deprecation messages use `⛔` and shorten the same way: compact is `⛔ deprecated: <message>`, level is `⛔ deprecated`. The no-update note goes to `⛔ 2.88.3 (patch) deprecated — no update offered`, then `⛔ no update`.
 
 `check_vulnerabilities` turns the security check off when set to `false` (default `true`).
 

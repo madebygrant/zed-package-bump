@@ -9,6 +9,7 @@ import {
   type CodeAction,
   type TextEdit,
   type Range,
+  type WorkspaceEdit,
 } from 'vscode-languageserver/node';
 import { TextDocument } from 'vscode-languageserver-textdocument';
 
@@ -22,6 +23,9 @@ const CACHE_TTL_MS = 5 * 60 * 1000;
 const AUDIT_TTL_MS = 60 * 60 * 1000;
 const MAX_CONCURRENT = 8;
 const MAX_META_CACHE = 500;
+/* deprecation notes are free text and can run long — cap before caching
+   so 500 packages × every published version stays bounded */
+const MAX_DEPRECATION_LEN = 160;
 
 const DEP_SECTIONS = [
   'dependencies',
@@ -53,10 +57,18 @@ interface CacheEntry {
   latest: string | null;
   /* every published version, ascending — used to find vulnerability fixes */
   versions: string[];
+  /* deprecation message per deprecated version, truncated at store */
+  deprecated: Map<string, string>;
+  /* packument last-modified timestamp (ISO) — publishes, deprecations,
+     owner changes all move it */
+  modified: string | null;
   ts: number;
 }
 
 const metaCache = new Map<string, CacheEntry>();
+
+/* stand-in when a package has no cache entry — read-only by convention */
+const NO_DEPRECATIONS: ReadonlyMap<string, string> = new Map();
 
 /* complete: "eslint: 9.39.4 → 10.8.1 (major)"
    compact:  "→ 10.8.1 (major)"
@@ -64,6 +76,9 @@ const metaCache = new Map<string, CacheEntry>();
 type MessageStyle = 'complete' | 'compact' | 'level';
 let messageStyle: MessageStyle = 'compact';
 let checkVulnerabilities = true;
+/* clients without documentChanges support ignore that form entirely — fall
+   back to `changes` rather than shipping an edit they silently drop */
+let supportsDocumentChanges = false;
 
 function applySettings(settings: unknown): void {
   const s = settings as
@@ -168,11 +183,14 @@ type BumpLevel = 'major' | 'minor' | 'patch';
 
 /* newest stable update per tier: patch (same major.minor), minor (same
    major), major — only versions above `current` and at or below the
-   `latest` dist-tag, so pre-releases published past `latest` stay hidden */
+   `latest` dist-tag, so pre-releases published past `latest` stay hidden.
+   Deprecated versions are never offered: bumping into one would only earn
+   a deprecation warning on the next pass */
 function tierUpdates(
   versions: string[],
   current: string,
   latest: string,
+  deprecated: ReadonlyMap<string, string>,
 ): TierUpdate[] {
   const pc = parseSemver(current);
   if (!pc) return [];
@@ -181,7 +199,7 @@ function tierUpdates(
   let major: string | null = null;
   for (const v of versions) {
     const p = parseSemver(v);
-    if (!p || p[3]) continue;
+    if (!p || p[3] || deprecated.has(v)) continue;
     if (semverCmp(v, current) <= 0 || semverCmp(v, latest) > 0) continue;
     if (p[0] === pc[0] && p[1] === pc[1]) {
       if (!patch || semverCmp(v, patch) > 0) patch = v;
@@ -199,7 +217,7 @@ function tierUpdates(
   /* no stable tier but latest is still newer (prerelease-only package, or
      a prerelease bump like rc.1 → rc.2) — offer latest itself */
   const pl = parseSemver(latest);
-  if (!tiers.length && pl && semverCmp(latest, current) > 0) {
+  if (!tiers.length && pl && !deprecated.has(latest) && semverCmp(latest, current) > 0) {
     const level: BumpLevel =
       pl[0] !== pc[0] ? 'major' : pl[1] !== pc[1] ? 'minor' : 'patch';
     tiers.push({ level, version: latest });
@@ -218,12 +236,20 @@ const SEVERITY_BY_LEVEL: Record<BumpLevel, DiagnosticSeverity> = {
 
 // ---------- registry ----------
 
+function truncateNote(note: string): string {
+  return note.length > MAX_DEPRECATION_LEN
+    ? `${note.slice(0, MAX_DEPRECATION_LEN - 3)}…`
+    : note;
+}
+
 async function fetchMeta(name: string): Promise<CacheEntry> {
   const cached = metaCache.get(name);
   if (cached && Date.now() - cached.ts < CACHE_TTL_MS) return cached;
 
   let latest: string | null = null;
   let versions: string[] = [];
+  const deprecated = new Map<string, string>();
+  let modified: string | null = null;
   try {
     const res = await fetch(
       `${REGISTRY_URL}/${encodeURIComponent(name).replace('%40', '@')}`,
@@ -238,17 +264,24 @@ async function fetchMeta(name: string): Promise<CacheEntry> {
     if (res.ok) {
       const body = (await res.json()) as {
         'dist-tags'?: Record<string, string>;
-        versions?: Record<string, unknown>;
+        versions?: Record<string, { deprecated?: string | boolean }>;
+        modified?: string;
       };
       latest = body['dist-tags']?.latest ?? null;
       versions = Object.keys(body.versions ?? {})
         .filter((v) => parseSemver(v) !== null)
         .sort(semverCmp);
+      modified = body.modified ?? null;
+      for (const [v, manifest] of Object.entries(body.versions ?? {})) {
+        const d = manifest?.deprecated;
+        if (typeof d === 'string' && d) deprecated.set(v, truncateNote(d));
+        else if (d === true) deprecated.set(v, 'deprecated');
+      }
     }
   } catch {
     /* network failure → no diagnostic, retry after TTL */
   }
-  const entry = { latest, versions, ts: Date.now() };
+  const entry = { latest, versions, deprecated, modified, ts: Date.now() };
   /* version lists can run to thousands of entries (@types/*) — evict the
      oldest insertions rather than grow without bound */
   if (metaCache.size >= MAX_META_CACHE) {
@@ -261,20 +294,21 @@ async function fetchMeta(name: string): Promise<CacheEntry> {
   return entry;
 }
 
-/* smallest stable version above `current` that no advisory range matches.
-   A range we can't parse means we can't prove any version safe — fail
-   closed and suggest nothing rather than guess */
+/* smallest stable, non-deprecated version above `current` that no advisory
+   range matches. A range we can't parse means we can't prove any version
+   safe — fail closed and suggest nothing rather than guess */
 function firstSafeVersion(
   versions: string[],
   current: string,
   advisories: Advisory[],
+  deprecated: ReadonlyMap<string, string>,
 ): string | null {
   if (advisories.some((a) => !rangeParseable(a.vulnerable_versions))) {
     return null;
   }
   for (const v of versions) {
     const p = parseSemver(v);
-    if (!p || p[3]) continue;
+    if (!p || p[3] || deprecated.has(v)) continue;
     if (semverCmp(v, current) <= 0) continue;
     if (advisories.every((a) => !satisfiesRange(v, a.vulnerable_versions))) {
       return v;
@@ -494,14 +528,24 @@ async function validate(uri: string): Promise<void> {
   if (!fresh || fresh.version !== version) return;
 
   const findings: DepFinding[] = [];
+  /* newer versions exist but every one is deprecated, so nothing is
+     offerable and no finding is produced — reported separately rather
+     than leaving the line silent */
+  const withheld: Array<{ site: (typeof sites)[number]; tier: TierUpdate }> =
+    [];
   for (const site of sites) {
     const meta = metaByName.get(site.name);
     if (!meta?.latest) continue;
     const bare = site.current.replace(/^[\^~]/, '');
     /* no version list (unusual registry response) → fall back to latest */
     const pool = meta.versions.length ? meta.versions : [meta.latest];
-    const tiers = tierUpdates(pool, bare, meta.latest);
-    if (!tiers.length) continue;
+    const tiers = tierUpdates(pool, bare, meta.latest, meta.deprecated);
+    if (!tiers.length) {
+      const ignored = tierUpdates(pool, bare, meta.latest, NO_DEPRECATIONS);
+      const top = ignored[ignored.length - 1];
+      if (top) withheld.push({ site, tier: top });
+      continue;
+    }
     findings.push({
       ...site,
       latest: tiers[tiers.length - 1].version,
@@ -516,12 +560,17 @@ async function validate(uri: string): Promise<void> {
     const list = f.tiers
       .map((t) => `${t.version} (${t.level})`)
       .join(' | ');
+    const modified = metaByName.get(f.name)?.modified;
+    const published =
+      modified && messageStyle === 'complete'
+        ? ` — updated ${modified.slice(0, 10)}`
+        : '';
     const message =
       messageStyle === 'level'
         ? highest.level
         : messageStyle === 'compact'
           ? `→ ${list}`
-          : `${f.name}: ${bare} → ${list}`;
+          : `${f.name}: ${bare} → ${list}${published}`;
     return {
       range: f.range,
       severity: SEVERITY_BY_LEVEL[highest.level],
@@ -530,6 +579,41 @@ async function validate(uri: string): Promise<void> {
       data: { name: f.name, latest: f.latest },
     };
   });
+
+  /* deprecated versions get their own warning regardless of update status */
+  for (const site of sites) {
+    const bare = site.current.replace(/^[\^~]/, '');
+    const note = metaByName.get(site.name)?.deprecated.get(bare);
+    if (note === undefined) continue;
+    diagnostics.push({
+      range: site.range,
+      severity: DiagnosticSeverity.Warning,
+      source: 'package-bump',
+      message:
+        messageStyle === 'level'
+          ? '⛔ deprecated'
+          : messageStyle === 'compact'
+            ? `⛔ deprecated: ${note}`
+            : `${site.name} ${bare} is deprecated: ${note}`,
+    });
+  }
+
+  /* informational: there is nothing to click, the point is that the
+     silence is deliberate */
+  for (const { site, tier } of withheld) {
+    const bare = site.current.replace(/^[\^~]/, '');
+    diagnostics.push({
+      range: site.range,
+      severity: DiagnosticSeverity.Information,
+      source: 'package-bump',
+      message:
+        messageStyle === 'level'
+          ? '⛔ no update'
+          : messageStyle === 'compact'
+            ? `⛔ ${tier.version} (${tier.level}) deprecated — no update offered`
+            : `${site.name}: ${bare} → ${tier.version} (${tier.level}) is deprecated — no update offered`,
+    });
+  }
 
   const vulnFixes: VulnFix[] = [];
   if (checkVulnerabilities) {
@@ -548,15 +632,17 @@ async function validate(uri: string): Promise<void> {
       const bare = site.current.replace(/^[\^~]/, '');
       const matched = advisoriesFor(site.name, bare);
       if (!matched.length) continue;
+      const meta = metaByName.get(site.name);
       vulnSites.push({
         site,
         bare,
         matched,
         known: new Map(matched.map((a) => [a.id, a])),
         fix: firstSafeVersion(
-          metaByName.get(site.name)?.versions ?? [],
+          meta?.versions ?? [],
           bare,
           matched,
+          meta?.deprecated ?? NO_DEPRECATIONS,
         ),
         verified: false,
       });
@@ -579,10 +665,12 @@ async function validate(uri: string): Promise<void> {
           continue;
         }
         for (const a of extra) v.known.set(a.id, a);
+        const meta = metaByName.get(v.site.name);
         v.fix = firstSafeVersion(
-          metaByName.get(v.site.name)?.versions ?? [],
+          meta?.versions ?? [],
           v.bare,
           [...v.known.values()],
+          meta?.deprecated ?? NO_DEPRECATIONS,
         );
       }
     }
@@ -637,9 +725,53 @@ function bumpEdit(
 
 connection.onCodeAction((params) => {
   const uri = params.textDocument.uri;
-  const findings = findingsByUri.get(uri) ?? [];
-  const vulnFixes = vulnFixesByUri.get(uri) ?? [];
-  if (!findings.length && !vulnFixes.length) return [];
+  const doc = documents.get(uri);
+  const cachedFindings = findingsByUri.get(uri) ?? [];
+  const cachedVulnFixes = vulnFixesByUri.get(uri) ?? [];
+  if (!doc || (!cachedFindings.length && !cachedVulnFixes.length)) return [];
+
+  /* findings were located against the text as of the last validation; the
+     document may have changed since (a previous bump, typing). Re-locate
+     each version string in the CURRENT text and drop findings that no
+     longer exist, so edits can never splice stale offsets. Each fresh site
+     is claimed by at most one finding — a name appearing in two sections
+     with the same range must not collapse onto one site once the other is
+     bumped, or "update all" would emit overlapping edits. `cachedRange` is
+     kept because params.context.diagnostics still carries the old ranges */
+  const freshSites = findVersionRanges(doc, collectDeps(doc.getText()));
+  const relocate = <T extends { name: string; current: string; range: Range }>(
+    cached: T[],
+  ): Array<T & { cachedRange: Range }> => {
+    const claimed = new Set<number>();
+    return cached.flatMap((f) => {
+      let best = -1;
+      let bestDist = Infinity;
+      freshSites.forEach((s, i) => {
+        if (claimed.has(i) || s.name !== f.name || s.current !== f.current) {
+          return;
+        }
+        const dist = Math.abs(s.range.start.line - f.range.start.line);
+        if (dist < bestDist) {
+          bestDist = dist;
+          best = i;
+        }
+      });
+      if (best < 0) return [];
+      claimed.add(best);
+      return [{ ...f, range: freshSites[best].range, cachedRange: f.range }];
+    });
+  };
+  const findings = relocate(cachedFindings);
+  const vulnFixes = relocate(cachedVulnFixes);
+
+  const editFor = (edits: TextEdit[]): WorkspaceEdit =>
+    supportsDocumentChanges
+      ? {
+          /* null version = "unknown": relocation above is the real staleness
+             guard, so don't make the client drop the edit over a keystroke */
+          documentChanges: [{ textDocument: { uri, version: null }, edits }],
+        }
+      : { changes: { [uri]: edits } };
 
   const actions: CodeAction[] = [];
 
@@ -671,10 +803,10 @@ connection.onCodeAction((params) => {
         (d) =>
           d.source === 'package-bump' &&
           d.code !== undefined &&
-          d.range.start.line === f.range.start.line &&
-          d.range.start.character === f.range.start.character,
+          d.range.start.line === f.cachedRange.start.line &&
+          d.range.start.character === f.cachedRange.start.character,
       ),
-      edit: { changes: { [uri]: [bumpEdit(f)] } },
+      edit: editFor([bumpEdit(f)]),
     });
   }
 
@@ -685,8 +817,8 @@ connection.onCodeAction((params) => {
       (d) =>
         d.source === 'package-bump' &&
         (d.data as { name?: string } | undefined)?.name === f.name &&
-        d.range.start.line === f.range.start.line &&
-        d.range.start.character === f.range.start.character,
+        d.range.start.line === f.cachedRange.start.line &&
+        d.range.start.character === f.cachedRange.start.character,
     );
     const vulnFix = vulnInRange.find(
       (v) =>
@@ -701,7 +833,7 @@ connection.onCodeAction((params) => {
             : `Update ${f.name} to ${t.version} (${t.level})`,
         kind: CodeActionKind.QuickFix,
         diagnostics: attached,
-        edit: { changes: { [uri]: [bumpEdit(f, t.version)] } },
+        edit: editFor([bumpEdit(f, t.version)]),
       });
     }
   }
@@ -710,7 +842,7 @@ connection.onCodeAction((params) => {
     actions.push({
       title: `Update all ${findings.length} outdated packages`,
       kind: CodeActionKind.SourceFixAll,
-      edit: { changes: { [uri]: findings.map((f) => bumpEdit(f)) } },
+      edit: editFor(findings.map((f) => bumpEdit(f))),
     });
   }
 
@@ -721,6 +853,8 @@ connection.onCodeAction((params) => {
 
 connection.onInitialize((params) => {
   applySettings(params.initializationOptions);
+  supportsDocumentChanges =
+    params.capabilities.workspace?.workspaceEdit?.documentChanges === true;
   return {
     capabilities: {
       textDocumentSync: TextDocumentSyncKind.Incremental,

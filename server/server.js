@@ -9111,6 +9111,7 @@ var CACHE_TTL_MS = 5 * 60 * 1e3;
 var AUDIT_TTL_MS = 60 * 60 * 1e3;
 var MAX_CONCURRENT = 8;
 var MAX_META_CACHE = 500;
+var MAX_DEPRECATION_LEN = 160;
 var DEP_SECTIONS = [
   "dependencies",
   "devDependencies",
@@ -9119,8 +9120,10 @@ var DEP_SECTIONS = [
 ];
 var UPDATABLE_RE = /^([\^~]?)(\d+)\.(\d+)\.(\d+)(-[\w.-]+)?$/;
 var metaCache = /* @__PURE__ */ new Map();
+var NO_DEPRECATIONS = /* @__PURE__ */ new Map();
 var messageStyle = "compact";
 var checkVulnerabilities = true;
+var supportsDocumentChanges = false;
 function applySettings(settings) {
   const s = settings;
   const style = s?.message_style;
@@ -9199,7 +9202,7 @@ function satisfiesRange(version, range) {
     });
   });
 }
-function tierUpdates(versions, current, latest) {
+function tierUpdates(versions, current, latest, deprecated) {
   const pc = parseSemver(current);
   if (!pc) return [];
   let patch = null;
@@ -9207,7 +9210,7 @@ function tierUpdates(versions, current, latest) {
   let major = null;
   for (const v of versions) {
     const p = parseSemver(v);
-    if (!p || p[3]) continue;
+    if (!p || p[3] || deprecated.has(v)) continue;
     if (semverCmp(v, current) <= 0 || semverCmp(v, latest) > 0) continue;
     if (p[0] === pc[0] && p[1] === pc[1]) {
       if (!patch || semverCmp(v, patch) > 0) patch = v;
@@ -9222,7 +9225,7 @@ function tierUpdates(versions, current, latest) {
   if (minor) tiers.push({ level: "minor", version: minor });
   if (major) tiers.push({ level: "major", version: major });
   const pl = parseSemver(latest);
-  if (!tiers.length && pl && semverCmp(latest, current) > 0) {
+  if (!tiers.length && pl && !deprecated.has(latest) && semverCmp(latest, current) > 0) {
     const level = pl[0] !== pc[0] ? "major" : pl[1] !== pc[1] ? "minor" : "patch";
     tiers.push({ level, version: latest });
   }
@@ -9233,11 +9236,16 @@ var SEVERITY_BY_LEVEL = {
   minor: import_node.DiagnosticSeverity.Information,
   patch: import_node.DiagnosticSeverity.Hint
 };
+function truncateNote(note) {
+  return note.length > MAX_DEPRECATION_LEN ? `${note.slice(0, MAX_DEPRECATION_LEN - 3)}\u2026` : note;
+}
 async function fetchMeta(name) {
   const cached = metaCache.get(name);
   if (cached && Date.now() - cached.ts < CACHE_TTL_MS) return cached;
   let latest = null;
   let versions = [];
+  const deprecated = /* @__PURE__ */ new Map();
+  let modified = null;
   try {
     const res = await fetch(
       `${REGISTRY_URL}/${encodeURIComponent(name).replace("%40", "@")}`,
@@ -9253,10 +9261,16 @@ async function fetchMeta(name) {
       const body = await res.json();
       latest = body["dist-tags"]?.latest ?? null;
       versions = Object.keys(body.versions ?? {}).filter((v) => parseSemver(v) !== null).sort(semverCmp);
+      modified = body.modified ?? null;
+      for (const [v, manifest] of Object.entries(body.versions ?? {})) {
+        const d = manifest?.deprecated;
+        if (typeof d === "string" && d) deprecated.set(v, truncateNote(d));
+        else if (d === true) deprecated.set(v, "deprecated");
+      }
     }
   } catch {
   }
-  const entry = { latest, versions, ts: Date.now() };
+  const entry = { latest, versions, deprecated, modified, ts: Date.now() };
   if (metaCache.size >= MAX_META_CACHE) {
     for (const key of metaCache.keys()) {
       if (metaCache.size < MAX_META_CACHE) break;
@@ -9266,13 +9280,13 @@ async function fetchMeta(name) {
   metaCache.set(name, entry);
   return entry;
 }
-function firstSafeVersion(versions, current, advisories) {
+function firstSafeVersion(versions, current, advisories, deprecated) {
   if (advisories.some((a) => !rangeParseable(a.vulnerable_versions))) {
     return null;
   }
   for (const v of versions) {
     const p = parseSemver(v);
-    if (!p || p[3]) continue;
+    if (!p || p[3] || deprecated.has(v)) continue;
     if (semverCmp(v, current) <= 0) continue;
     if (advisories.every((a) => !satisfiesRange(v, a.vulnerable_versions))) {
       return v;
@@ -9427,13 +9441,19 @@ async function validate(uri) {
   const fresh = documents.get(uri);
   if (!fresh || fresh.version !== version) return;
   const findings = [];
+  const withheld = [];
   for (const site of sites) {
     const meta = metaByName.get(site.name);
     if (!meta?.latest) continue;
     const bare = site.current.replace(/^[\^~]/, "");
     const pool = meta.versions.length ? meta.versions : [meta.latest];
-    const tiers = tierUpdates(pool, bare, meta.latest);
-    if (!tiers.length) continue;
+    const tiers = tierUpdates(pool, bare, meta.latest, meta.deprecated);
+    if (!tiers.length) {
+      const ignored = tierUpdates(pool, bare, meta.latest, NO_DEPRECATIONS);
+      const top = ignored[ignored.length - 1];
+      if (top) withheld.push({ site, tier: top });
+      continue;
+    }
     findings.push({
       ...site,
       latest: tiers[tiers.length - 1].version,
@@ -9445,7 +9465,9 @@ async function validate(uri) {
     const bare = f.current.replace(/^[\^~]/, "");
     const highest = f.tiers[f.tiers.length - 1];
     const list = f.tiers.map((t) => `${t.version} (${t.level})`).join(" | ");
-    const message = messageStyle === "level" ? highest.level : messageStyle === "compact" ? `\u2192 ${list}` : `${f.name}: ${bare} \u2192 ${list}`;
+    const modified = metaByName.get(f.name)?.modified;
+    const published = modified && messageStyle === "complete" ? ` \u2014 updated ${modified.slice(0, 10)}` : "";
+    const message = messageStyle === "level" ? highest.level : messageStyle === "compact" ? `\u2192 ${list}` : `${f.name}: ${bare} \u2192 ${list}${published}`;
     return {
       range: f.range,
       severity: SEVERITY_BY_LEVEL[highest.level],
@@ -9454,6 +9476,26 @@ async function validate(uri) {
       data: { name: f.name, latest: f.latest }
     };
   });
+  for (const site of sites) {
+    const bare = site.current.replace(/^[\^~]/, "");
+    const note = metaByName.get(site.name)?.deprecated.get(bare);
+    if (note === void 0) continue;
+    diagnostics.push({
+      range: site.range,
+      severity: import_node.DiagnosticSeverity.Warning,
+      source: "package-bump",
+      message: messageStyle === "level" ? "\u26D4 deprecated" : messageStyle === "compact" ? `\u26D4 deprecated: ${note}` : `${site.name} ${bare} is deprecated: ${note}`
+    });
+  }
+  for (const { site, tier } of withheld) {
+    const bare = site.current.replace(/^[\^~]/, "");
+    diagnostics.push({
+      range: site.range,
+      severity: import_node.DiagnosticSeverity.Information,
+      source: "package-bump",
+      message: messageStyle === "level" ? "\u26D4 no update" : messageStyle === "compact" ? `\u26D4 ${tier.version} (${tier.level}) deprecated \u2014 no update offered` : `${site.name}: ${bare} \u2192 ${tier.version} (${tier.level}) is deprecated \u2014 no update offered`
+    });
+  }
   const vulnFixes = [];
   if (checkVulnerabilities) {
     const vulnSites = [];
@@ -9461,15 +9503,17 @@ async function validate(uri) {
       const bare = site.current.replace(/^[\^~]/, "");
       const matched = advisoriesFor(site.name, bare);
       if (!matched.length) continue;
+      const meta = metaByName.get(site.name);
       vulnSites.push({
         site,
         bare,
         matched,
         known: new Map(matched.map((a) => [a.id, a])),
         fix: firstSafeVersion(
-          metaByName.get(site.name)?.versions ?? [],
+          meta?.versions ?? [],
           bare,
-          matched
+          matched,
+          meta?.deprecated ?? NO_DEPRECATIONS
         ),
         verified: false
       });
@@ -9487,10 +9531,12 @@ async function validate(uri) {
           continue;
         }
         for (const a of extra) v.known.set(a.id, a);
+        const meta = metaByName.get(v.site.name);
         v.fix = firstSafeVersion(
-          metaByName.get(v.site.name)?.versions ?? [],
+          meta?.versions ?? [],
           v.bare,
-          [...v.known.values()]
+          [...v.known.values()],
+          meta?.deprecated ?? NO_DEPRECATIONS
         );
       }
     }
@@ -9524,9 +9570,38 @@ function bumpEdit(f, version = f.latest) {
 }
 connection.onCodeAction((params) => {
   const uri = params.textDocument.uri;
-  const findings = findingsByUri.get(uri) ?? [];
-  const vulnFixes = vulnFixesByUri.get(uri) ?? [];
-  if (!findings.length && !vulnFixes.length) return [];
+  const doc = documents.get(uri);
+  const cachedFindings = findingsByUri.get(uri) ?? [];
+  const cachedVulnFixes = vulnFixesByUri.get(uri) ?? [];
+  if (!doc || !cachedFindings.length && !cachedVulnFixes.length) return [];
+  const freshSites = findVersionRanges(doc, collectDeps(doc.getText()));
+  const relocate = (cached) => {
+    const claimed = /* @__PURE__ */ new Set();
+    return cached.flatMap((f) => {
+      let best = -1;
+      let bestDist = Infinity;
+      freshSites.forEach((s, i) => {
+        if (claimed.has(i) || s.name !== f.name || s.current !== f.current) {
+          return;
+        }
+        const dist = Math.abs(s.range.start.line - f.range.start.line);
+        if (dist < bestDist) {
+          bestDist = dist;
+          best = i;
+        }
+      });
+      if (best < 0) return [];
+      claimed.add(best);
+      return [{ ...f, range: freshSites[best].range, cachedRange: f.range }];
+    });
+  };
+  const findings = relocate(cachedFindings);
+  const vulnFixes = relocate(cachedVulnFixes);
+  const editFor = (edits) => supportsDocumentChanges ? {
+    /* null version = "unknown": relocation above is the real staleness
+       guard, so don't make the client drop the edit over a keystroke */
+    documentChanges: [{ textDocument: { uri, version: null }, edits }]
+  } : { changes: { [uri]: edits } };
   const actions = [];
   const overlapsCursor = (f) => f.range.start.line <= params.range.end.line && f.range.end.line >= params.range.start.line;
   const fixLabel = (f) => f.advisoryCount === 1 ? "fixes the vulnerability" : `fixes all ${f.advisoryCount} vulnerabilities`;
@@ -9540,15 +9615,15 @@ connection.onCodeAction((params) => {
       title: `Update ${f.name} to ${f.latest} (${fixLabel(f)})`,
       kind: import_node.CodeActionKind.QuickFix,
       diagnostics: params.context.diagnostics.filter(
-        (d) => d.source === "package-bump" && d.code !== void 0 && d.range.start.line === f.range.start.line && d.range.start.character === f.range.start.character
+        (d) => d.source === "package-bump" && d.code !== void 0 && d.range.start.line === f.cachedRange.start.line && d.range.start.character === f.cachedRange.start.character
       ),
-      edit: { changes: { [uri]: [bumpEdit(f)] } }
+      edit: editFor([bumpEdit(f)])
     });
   }
   const inRange = findings.filter(overlapsCursor);
   for (const f of inRange) {
     const attached = params.context.diagnostics.filter(
-      (d) => d.source === "package-bump" && d.data?.name === f.name && d.range.start.line === f.range.start.line && d.range.start.character === f.range.start.character
+      (d) => d.source === "package-bump" && d.data?.name === f.name && d.range.start.line === f.cachedRange.start.line && d.range.start.character === f.cachedRange.start.character
     );
     const vulnFix = vulnInRange.find(
       (v) => v.name === f.name && v.range.start.line === f.range.start.line
@@ -9558,7 +9633,7 @@ connection.onCodeAction((params) => {
         title: vulnFix && vulnFix.latest === t.version ? `Update ${f.name} to ${t.version} (${t.level}, ${fixLabel(vulnFix)})` : `Update ${f.name} to ${t.version} (${t.level})`,
         kind: import_node.CodeActionKind.QuickFix,
         diagnostics: attached,
-        edit: { changes: { [uri]: [bumpEdit(f, t.version)] } }
+        edit: editFor([bumpEdit(f, t.version)])
       });
     }
   }
@@ -9566,13 +9641,14 @@ connection.onCodeAction((params) => {
     actions.push({
       title: `Update all ${findings.length} outdated packages`,
       kind: import_node.CodeActionKind.SourceFixAll,
-      edit: { changes: { [uri]: findings.map((f) => bumpEdit(f)) } }
+      edit: editFor(findings.map((f) => bumpEdit(f)))
     });
   }
   return actions;
 });
 connection.onInitialize((params) => {
   applySettings(params.initializationOptions);
+  supportsDocumentChanges = params.capabilities.workspace?.workspaceEdit?.documentChanges === true;
   return {
     capabilities: {
       textDocumentSync: import_node.TextDocumentSyncKind.Incremental,
