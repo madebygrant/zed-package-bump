@@ -1,0 +1,25 @@
+{
+  "name": "package-bump-example",
+  "version": "0.0.0",
+  "private": true,
+  "description": "Not a real project. Open this file in Zed to see every diagnostic the extension produces. Never install it.",
+  "dependencies": {
+    "typescript": "5.4.0",
+    "react": "^18.2.0",
+    "vue": "~3.4.0",
+    "@types/node": "^20.0.0",
+    "lodash": "4.17.20",
+    "request": "^2.87.0",
+    "left-pad": "1.3.0",
+    "some-star": "*",
+    "some-range": ">=1.0.0",
+    "some-local": "file:../shared",
+    "some-workspace": "workspace:*"
+  },
+  "devDependencies": {
+    "eslint": "^9.0.0"
+  },
+  "peerDependencies": {
+    "react": "^18.2.0"
+  }
+}

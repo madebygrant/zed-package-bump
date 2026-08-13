@@ -586,11 +586,21 @@ async function validate(uri: string): Promise<void> {
     };
   });
 
+  const withheldBySite = new Map(withheld.map((w) => [w.site, w.tier]));
+
   /* deprecated versions get their own warning regardless of update status */
   for (const site of sites) {
     const bare = site.current.replace(/^[\^~]/, '');
     const note = metaByName.get(site.name)?.deprecated.get(bare);
     if (note === undefined) continue;
+    /* a withheld update on a line that is already flagged deprecated says
+       the same thing twice — fold it in and drop the separate note, which
+       spares the line a third diagnostic competing for the inline slot */
+    const tier = withheldBySite.get(site);
+    withheldBySite.delete(site);
+    const also = tier
+      ? ` (${tier.version} also deprecated — no update offered)`
+      : '';
     diagnostics.push({
       range: site.range,
       severity: DiagnosticSeverity.Warning,
@@ -599,14 +609,14 @@ async function validate(uri: string): Promise<void> {
         messageStyle === 'level'
           ? '⛔ deprecated'
           : messageStyle === 'compact'
-            ? `⛔ deprecated: ${note}`
-            : `${site.name} ${bare} is deprecated: ${note}`,
+            ? `⛔ deprecated: ${note}${also}`
+            : `${site.name} ${bare} is deprecated: ${note}${also}`,
     });
   }
 
   /* informational: there is nothing to click, the point is that the
      silence is deliberate */
-  for (const { site, tier } of withheld) {
+  for (const [site, tier] of withheldBySite) {
     const bare = site.current.replace(/^[\^~]/, '');
     diagnostics.push({
       range: site.range,

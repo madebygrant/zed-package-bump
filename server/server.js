@@ -9477,18 +9477,22 @@ async function validate(uri) {
       data: { name: f.name, latest: f.latest }
     };
   });
+  const withheldBySite = new Map(withheld.map((w) => [w.site, w.tier]));
   for (const site of sites) {
     const bare = site.current.replace(/^[\^~]/, "");
     const note = metaByName.get(site.name)?.deprecated.get(bare);
     if (note === void 0) continue;
+    const tier = withheldBySite.get(site);
+    withheldBySite.delete(site);
+    const also = tier ? ` (${tier.version} also deprecated \u2014 no update offered)` : "";
     diagnostics.push({
       range: site.range,
       severity: import_node.DiagnosticSeverity.Warning,
       source: "package-bump",
-      message: messageStyle === "level" ? "\u26D4 deprecated" : messageStyle === "compact" ? `\u26D4 deprecated: ${note}` : `${site.name} ${bare} is deprecated: ${note}`
+      message: messageStyle === "level" ? "\u26D4 deprecated" : messageStyle === "compact" ? `\u26D4 deprecated: ${note}${also}` : `${site.name} ${bare} is deprecated: ${note}${also}`
     });
   }
-  for (const { site, tier } of withheld) {
+  for (const [site, tier] of withheldBySite) {
     const bare = site.current.replace(/^[\^~]/, "");
     diagnostics.push({
       range: site.range,

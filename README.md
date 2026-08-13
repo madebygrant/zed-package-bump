@@ -2,40 +2,66 @@
 
 Flags outdated npm packages in `package.json` and adds code actions to bump the version numbers. It only edits the file — running `npm install` (or pnpm/yarn) afterwards is up to you.
 
-Open a `package.json` and outdated packages get underlined with a message like:
+![Diagnostics in a package.json, each outdated dependency underlined and annotated with the patch, minor and major versions available](examples/compact-mode.webp)
+
+## Updating packages
+
+Outdated dependencies get underlined with the newest patch, minor, and major above your current version. Tiers that don't exist are left out:
 
 ```
-react: 18.3.1 → 18.3.4 (patch) | 18.4.0 (minor) | 19.1.0 (major)
+→ 5.4.5 (patch) | 5.9.3 (minor) | 7.0.2 (major)
 ```
 
-Every available step is listed — the newest patch, minor, and major above your current version (only tiers that exist are shown). The severity matches the biggest available update: major = warning, minor = info, patch = hint.
+Severity follows the biggest update available, so you can tell at a glance how far behind a package is:
 
-Packages with known security vulnerabilities get a second diagnostic, checked against the npm advisory database (the same data `npm audit` uses):
-
-```
-lodash 4.17.20: 5 vulnerabilities (worst: high, fix: 4.18.0) — Command Injection in lodash
-```
-
-High and critical advisories show as errors, with a clickable link to the GitHub advisory. `fix:` names the smallest stable, non-deprecated version that clears every advisory, and `cmd-.` offers **Update `<name>` to `<version>` (fixes all N vulnerabilities)** — useful when the safe version is closer than latest. Note this checks the version written in `package.json`, not what's actually installed in `node_modules`.
+| biggest update | severity |
+| -------------- | ----------- |
+| major          | warning     |
+| minor          | info        |
+| patch          | hint        |
 
 Put the cursor on a package line and press `cmd-.`:
 
 - **Update `<name>` to `<version>` (patch/minor/major)** — one action per available tier, keeping your `^` or `~` prefix.
-- **Update all N outdated packages** — updates the whole file to the newest versions at once.
+- **Update all N outdated packages** — rewrites every outdated version in the file at once.
 
-Deprecated versions get a warning with the maintainer's message:
+![Code action menu on a lodash line, offering the minor update labelled as fixing all 5 vulnerabilities, the patch update, and update all](examples/context-menu.webp)
+
+The newest version leads the menu. A tier that also clears a security advisory says so in its own label instead of adding a separate action.
+
+## Vulnerabilities
+
+Packages with known advisories get a second diagnostic, checked against the npm advisory database (the same data `npm audit` uses):
+
+```
+lodash 4.17.20: 5 vulnerabilities (worst: high, fix: 4.18.1) — Command Injection in lodash
+```
+
+High and critical advisories show as errors, with a clickable link to the GitHub advisory. `fix:` names the smallest stable, non-deprecated version that clears every advisory, and `cmd-.` offers **Update `<name>` to `<version>` (fixes all N vulnerabilities)** — useful when the safe version is closer than latest.
+
+This checks the version written in `package.json`, not what's actually installed in `node_modules`.
+
+## Deprecated versions
+
+Deprecated packages get a warning carrying the maintainer's message:
 
 ```
 request 2.88.2 is deprecated: request has been deprecated, see https://github.com/request/request/issues/3142
 ```
 
-Nothing deprecated is ever suggested as a bump target, vulnerability fixes included. If everything above your version is deprecated there's no action to offer, so you get a note instead:
+A deprecated version is never offered as an update target, including as a vulnerability fix. When everything newer is deprecated there's nothing to offer, so you get a note:
 
 ```
-request 2.88.2 → 2.88.3 (patch) is deprecated — no update offered
+some-pkg 1.2.0 → 1.3.0 (minor) is deprecated — no update offered
 ```
 
-Version ranges the extension can't safely rewrite (`workspace:`, `file:`, `*`, `>=`, etc.) are ignored. So are manifests under `node_modules` — npm overwrites those on the next install.
+If your own version is deprecated as well, that note joins the warning: `… is deprecated: <message> (1.3.0 also deprecated — no update offered)`.
+
+## What's skipped
+
+Version ranges the extension can't safely rewrite (`workspace:`, `file:`, `*`, `>=`, and anything else that isn't a plain version number) are left alone. So are manifests under `node_modules`, since npm overwrites those on the next install.
+
+`examples/package.json` triggers every diagnostic at once — open it after installing to check the extension is working. Don't install its dependencies; they're deliberately broken.
 
 ## Install
 
@@ -61,13 +87,7 @@ If a project's `.zed/settings.json` sets a `language_servers` allowlist for JSON
 
 ## Settings
 
-`message_style` picks the diagnostic format. Default is `"compact"` (`→ 10.8.1 (major)`); `"complete"` adds the name, current version, and registry update date (`eslint: 9.39.4 → 10.8.1 (major) — updated 2026-08-12`), `"level"` is just `major`/`minor`/`patch`.
-
-Vulnerability messages follow the same setting, marked with `⚠`: compact is `⚠ 5 vulnerabilities (high)`, level is `⚠ high`.
-
-Deprecation messages use `⛔` and shorten the same way: compact is `⛔ deprecated: <message>`, level is `⛔ deprecated`. The no-update note goes to `⛔ 2.88.3 (patch) deprecated — no update offered`, then `⛔ no update`.
-
-`check_vulnerabilities` turns the security check off when set to `false` (default `true`).
+These go in Zed's `settings.json`, or in `.zed/settings.json` to apply to one project:
 
 ```jsonc
 {
@@ -82,13 +102,33 @@ Deprecation messages use `⛔` and shorten the same way: compact is `⛔ depreca
 }
 ```
 
+`message_style` picks how much each diagnostic says:
+
+| value                 | example                                                  |
+| --------------------- | -------------------------------------------------------- |
+| `"compact"` (default) | `→ 10.8.1 (major)`                                        |
+| `"complete"`          | `eslint: 9.39.4 → 10.8.1 (major) — updated 2026-08-12`    |
+| `"level"`             | `major`                                                   |
+
+Vulnerability and deprecation messages shorten the same way, marked with `⚠` and `⛔` — a vulnerability is `⚠ 5 vulnerabilities (high)` in compact and `⚠ high` in level, a deprecation is `⛔ deprecated: <message>` then `⛔ deprecated`.
+
+`"complete"` and `"level"` on the same file (`"compact"` is the screenshot at the top):
+
+![Complete style, each message prefixed with the package name and current version and ending with the registry update date](examples/complete-mode.webp)
+
+![Level style, each message reduced to a single word such as major, minor, or deprecated](examples/level-mode.webp)
+
+Zed only shows one message per line inline, so a package with both an update and a warning shows the more severe one. The diagnostics panel lists the rest.
+
+`check_vulnerabilities` turns the security check off when set to `false` (default `true`).
+
 ## Development
 
 `src/lib.rs` is a Rust wasm shim. It embeds the bundled server (`server/server.js`) at compile time via `include_str!`, writes it to the extension work dir on launch, and runs it with Zed's managed Node.
 
 The server reads `dist-tags.latest` from the npm registry (abbreviated metadata, cached in memory for 5 minutes). All four dependency sections are scanned, and a package listed in more than one section is flagged in each. Prereleases compare per semver, so `^1.0.0-rc.1` is flagged once `1.0.0` ships.
 
-Vulnerabilities come from the registry's bulk advisories endpoint (`/-/npm/v1/security/advisories/bulk`), a few POSTs per file, cached for an hour per `name@version`. Suggested fix versions are themselves audited before being shown — a candidate that turns out to carry its own advisories is skipped for the next clean one. The declared version (range prefix stripped) is what gets checked — lockfile-aware checking of actually-installed versions would be a separate feature.
+Vulnerabilities come from the registry's bulk advisories endpoint (`/-/npm/v1/security/advisories/bulk`), a few POSTs per file, cached for an hour per `name@version`. Suggested fix versions are themselves audited before being shown — a candidate that turns out to carry its own advisories is skipped for the next clean one. The declared version (range prefix stripped) is what gets checked; lockfile-aware checking of actually-installed versions would be a separate feature.
 
 After editing `lsp/src/`, rebuild with `pnpm --dir lsp build`, then Zed → Extensions → Package Bump → **Rebuild** and reopen the file. LSP logs are under `dev: open language server logs`.
 
