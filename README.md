@@ -24,8 +24,9 @@ Put the cursor on a package line and press `cmd-.`:
 
 - **Update `<name>` to `<version>` (patch/minor/major)** — one action per available tier, keeping your `^` or `~` prefix.
 - **Update all N outdated packages** — rewrites every outdated version in the file at once.
+- **Save dependency report** — writes the summary described in [Report](#report) instead of editing the file.
 
-![Code action menu on a typescript line, listing the major, minor and patch updates newest first, then update all 8 outdated packages](examples/context-menu.webp)
+![Code action menu on a lodash line: the minor update labelled as fixing all 5 vulnerabilities, then the patch update, update all 8 outdated packages, and save dependency report](examples/context-menu.webp)
 
 The newest version leads the menu. A tier that also clears a security advisory says so in its own label instead of adding a separate action.
 
@@ -62,6 +63,36 @@ A package that is both deprecated and vulnerable is one problem, not two, so it 
 ```
 ⚠ ⊘ 16 vulnerabilities (critical, fix: 7.5.21); deprecated: Old versions of tar are not supported…
 ```
+
+## Report
+
+**Save dependency report** in the `cmd-.` menu drops a plain-text summary next to the `package.json` and opens it — handy for pasting into a ticket or keeping a record of what's still behind. Rows trimmed from this excerpt, hence the counts:
+
+```
+package-bump report — examples/package.json
+2026-08-18
+
+OUTDATED (7)
+  typescript      5.4.0    → 5.4.5 (patch) | 5.9.3 (minor) | 7.0.2 (major)
+  react           18.2.0   → 18.3.1 (minor) | 19.2.8 (major)
+
+VULNERABLE (3)
+  lodash          4.17.20  5 vulnerabilities (high, fix: 4.18.1)
+  request         2.87.0   1 vulnerability (moderate, no safe version)
+
+DEPRECATED (3)
+  left-pad        1.3.0    use String.prototype.padStart()
+
+NO UPDATE OFFERED (1)
+  request         2.87.0   2.88.2 (minor) is deprecated
+
+SKIPPED (4)
+  some-workspace  workspace:*
+```
+
+Empty sections are left out, and a manifest with nothing outstanding writes `Everything is up to date.` The file is rewritten each time the action runs, always at `package-bump-report.txt` beside the manifest, so it's worth adding to `.gitignore`. Contents come from the last diagnostics pass — no extra registry traffic.
+
+A package listed in two sections is one row here, unlike the diagnostics, which flag every site. Skipped ranges appear only in the report; they carry no diagnostic.
 
 ## What's skipped
 

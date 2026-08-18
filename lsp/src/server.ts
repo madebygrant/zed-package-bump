@@ -12,6 +12,9 @@ import {
   type WorkspaceEdit,
 } from 'vscode-languageserver/node';
 import { TextDocument } from 'vscode-languageserver-textdocument';
+import { writeFile } from 'node:fs/promises';
+import { fileURLToPath, pathToFileURL } from 'node:url';
+import * as path from 'node:path';
 
 const connection = createConnection(ProposedFeatures.all);
 const documents = new TextDocuments(TextDocument);
@@ -26,6 +29,9 @@ const MAX_META_CACHE = 500;
 /* deprecation notes are free text and can run long — cap before caching
    so 500 packages × every published version stays bounded */
 const MAX_DEPRECATION_LEN = 160;
+
+const REPORT_COMMAND = 'packageBump.writeReport';
+const REPORT_FILENAME = 'package-bump-report.txt';
 
 const DEP_SECTIONS = [
   'dependencies',
@@ -79,6 +85,11 @@ let checkVulnerabilities = true;
 /* clients without documentChanges support ignore that form entirely — fall
    back to `changes` rather than shipping an edit they silently drop */
 let supportsDocumentChanges = false;
+/* window/showDocument lets the report open in the editor after writing;
+   without it the path is only announced in a message */
+let supportsShowDocument = false;
+/* used to print manifest paths relative to the project in the report */
+let workspaceRoot: string | null = null;
 
 function applySettings(settings: unknown): void {
   const s = settings as
@@ -453,6 +464,31 @@ function collectDeps(text: string): Map<string, Set<string>> {
   return deps;
 }
 
+/* the inverse of collectDeps: ranges we deliberately leave alone. Nothing
+   is diagnosed for these, so the report is the only place they surface */
+function collectSkipped(text: string): Array<{ name: string; range: string }> {
+  const seen = new Set<string>();
+  const out: Array<{ name: string; range: string }> = [];
+  let parsed: Record<string, unknown>;
+  try {
+    parsed = JSON.parse(text);
+  } catch {
+    return out;
+  }
+  for (const section of DEP_SECTIONS) {
+    const block = parsed[section];
+    if (!block || typeof block !== 'object') continue;
+    for (const [name, range] of Object.entries(block)) {
+      if (typeof range !== 'string' || UPDATABLE_RE.test(range)) continue;
+      const key = `${name}@${range}`;
+      if (seen.has(key)) continue;
+      seen.add(key);
+      out.push({ name, range });
+    }
+  }
+  return out;
+}
+
 /* locate the value range of every `"name": "range"` pair matching a known dep */
 function findVersionRanges(
   doc: TextDocument,
@@ -492,6 +528,25 @@ interface VulnFix {
   advisoryCount: number;
 }
 const vulnFixesByUri = new Map<string, VulnFix[]>();
+
+/* everything the report prints, captured during validation so writing it
+   costs no extra registry traffic */
+interface ReportData {
+  uri: string;
+  outdated: Array<{ name: string; current: string; tiers: TierUpdate[] }>;
+  vulnerable: Array<{
+    name: string;
+    current: string;
+    count: number;
+    severity: Advisory['severity'];
+    fix: string | null;
+  }>;
+  deprecated: Array<{ name: string; current: string; note: string }>;
+  /* newer versions exist but all of them are deprecated */
+  withheld: Array<{ name: string; current: string; tier: TierUpdate }>;
+  skipped: Array<{ name: string; range: string }>;
+}
+const reportByUri = new Map<string, ReportData>();
 
 function scheduleValidation(doc: TextDocument): void {
   /* Zed attaches the server to every JSON buffer — it can't match on
@@ -560,6 +615,23 @@ async function validate(uri: string): Promise<void> {
   }
   findingsByUri.set(uri, findings);
 
+  const report: ReportData = {
+    uri,
+    outdated: findings.map((f) => ({
+      name: f.name,
+      current: f.current.replace(/^[\^~]/, ''),
+      tiers: f.tiers,
+    })),
+    vulnerable: [],
+    deprecated: [],
+    withheld: withheld.map(({ site, tier }) => ({
+      name: site.name,
+      current: site.current.replace(/^[\^~]/, ''),
+      tier,
+    })),
+    skipped: collectSkipped(fresh.getText()),
+  };
+
   const diagnostics: Diagnostic[] = findings.map((f) => {
     const bare = f.current.replace(/^[\^~]/, '');
     const highest = f.tiers[f.tiers.length - 1];
@@ -604,6 +676,9 @@ async function validate(uri: string): Promise<void> {
       ? ` (${tier.version} also deprecated — no update offered)`
       : '';
     deprecationBySite.set(site, `${note}${also}`);
+    /* the report keeps deprecated packages in their own section even when
+       the diagnostic folds the text into a vulnerability line below */
+    report.deprecated.push({ name: site.name, current: bare, note });
   }
 
   /* informational: there is nothing to click, the point is that the
@@ -690,6 +765,13 @@ async function validate(uri: string): Promise<void> {
       );
       const n = matched.length;
       if (safe) vulnFixes.push({ ...site, latest: safe, advisoryCount: n });
+      report.vulnerable.push({
+        name: site.name,
+        current: bare,
+        count: n,
+        severity: worst.severity,
+        fix: safe,
+      });
       const count = `${n} ${n === 1 ? 'vulnerability' : 'vulnerabilities'}`;
       const fixNote = safe ? `, fix: ${safe}` : '';
       /* a deprecated package with advisories reads as one problem, not two:
@@ -745,8 +827,127 @@ async function validate(uri: string): Promise<void> {
   if (documents.get(uri)?.version !== version) return;
 
   vulnFixesByUri.set(uri, vulnFixes);
+  reportByUri.set(uri, report);
 
   connection.sendDiagnostics({ uri, diagnostics });
+}
+
+// ---------- report ----------
+
+/* path as the user thinks of it: relative to the project when the file
+   sits inside it, absolute otherwise */
+function displayPath(fsPath: string): string {
+  if (!workspaceRoot) return fsPath;
+  const rel = path.relative(workspaceRoot, fsPath);
+  return rel && !rel.startsWith('..') && !path.isAbsolute(rel) ? rel : fsPath;
+}
+
+function formatReport(data: ReportData, today: string): string {
+  const fsPath = fileURLToPath(data.uri);
+  const lines = [`package-bump report — ${displayPath(fsPath)}`, today, ''];
+
+  const nameW = Math.max(
+    0,
+    ...data.outdated.map((r) => r.name.length),
+    ...data.vulnerable.map((r) => r.name.length),
+    ...data.deprecated.map((r) => r.name.length),
+    ...data.withheld.map((r) => r.name.length),
+    ...data.skipped.map((r) => r.name.length),
+  );
+  const versionW = Math.max(
+    0,
+    ...data.outdated.map((r) => r.current.length),
+    ...data.vulnerable.map((r) => r.current.length),
+    ...data.deprecated.map((r) => r.current.length),
+    ...data.withheld.map((r) => r.current.length),
+  );
+  const row = (name: string, second: string, rest: string): string =>
+    `  ${name.padEnd(nameW)}  ${second.padEnd(versionW)}  ${rest}`.trimEnd();
+
+  /* a package listed in two sections produces two identical rows — the
+     diagnostics flag both sites, but the report is about packages */
+  const section = (title: string, rows: string[]): void => {
+    const unique = [...new Set(rows)];
+    if (!unique.length) return;
+    lines.push(`${title} (${unique.length})`, ...unique, '');
+  };
+
+  section(
+    'OUTDATED',
+    data.outdated.map((r) =>
+      row(
+        r.name,
+        r.current,
+        `→ ${r.tiers.map((t) => `${t.version} (${t.level})`).join(' | ')}`,
+      ),
+    ),
+  );
+  section(
+    'VULNERABLE',
+    data.vulnerable.map((r) =>
+      row(
+        r.name,
+        r.current,
+        `${r.count} ${r.count === 1 ? 'vulnerability' : 'vulnerabilities'} (${r.severity}${r.fix ? `, fix: ${r.fix}` : ', no safe version'})`,
+      ),
+    ),
+  );
+  section(
+    'DEPRECATED',
+    data.deprecated.map((r) => row(r.name, r.current, r.note)),
+  );
+  section(
+    'NO UPDATE OFFERED',
+    data.withheld.map((r) =>
+      row(
+        r.name,
+        r.current,
+        `${r.tier.version} (${r.tier.level}) is deprecated`,
+      ),
+    ),
+  );
+  section(
+    'SKIPPED',
+    data.skipped.map((r) => row(r.name, r.range, '')),
+  );
+
+  if (lines.length === 3) lines.push('Everything is up to date.', '');
+  return lines.join('\n');
+}
+
+async function writeReport(uri: string): Promise<void> {
+  const data = reportByUri.get(uri);
+  if (!data) return;
+  const target = path.join(path.dirname(fileURLToPath(uri)), REPORT_FILENAME);
+  const today = new Date().toISOString().slice(0, 10);
+  try {
+    await writeFile(target, formatReport(data, today), 'utf8');
+  } catch (err) {
+    const reason = err instanceof Error ? err.message : String(err);
+    connection.window.showErrorMessage(
+      `Package Bump: could not write ${target} — ${reason}`,
+    );
+    return;
+  }
+  const announce = () =>
+    connection.window.showInformationMessage(
+      `Package Bump: wrote ${displayPath(target)}`,
+    );
+  if (!supportsShowDocument) {
+    announce();
+    return;
+  }
+  /* showDocument is a request: a client that declines it (or advertises
+     support without implementing it) answers with an error, and an
+     unhandled rejection would take the whole server down */
+  await connection.window
+    .showDocument({ uri: pathToFileURL(target).toString(), takeFocus: true })
+    .then(
+      (result) => {
+        if (!result.success) announce();
+      },
+      () => announce(),
+    );
 }
 
 // ---------- code actions ----------
@@ -764,7 +965,23 @@ connection.onCodeAction((params) => {
   const doc = documents.get(uri);
   const cachedFindings = findingsByUri.get(uri) ?? [];
   const cachedVulnFixes = vulnFixesByUri.get(uri) ?? [];
-  if (!doc || (!cachedFindings.length && !cachedVulnFixes.length)) return [];
+  const hasReport = reportByUri.has(uri);
+  if (!doc) return [];
+  if (!cachedFindings.length && !cachedVulnFixes.length && !hasReport) {
+    return [];
+  }
+
+  /* clients that run code actions on save request one kind and apply
+     everything they get back — an unfiltered response would bump versions
+     and write the report file on every save. Kinds match by prefix per
+     spec, so `source` is not offered to a `source.fixAll` request */
+  const only = params.context.only;
+  const wants = (kind: string): boolean =>
+    !only || only.some((k) => kind === k || kind.startsWith(`${k}.`));
+  const wantsQuickFix = wants(CodeActionKind.QuickFix);
+  const wantsFixAll = wants(CodeActionKind.SourceFixAll);
+  const wantsReport = hasReport && wants(CodeActionKind.Source);
+  if (!wantsQuickFix && !wantsFixAll && !wantsReport) return [];
 
   /* findings were located against the text as of the last validation; the
      document may have changed since (a previous bump, typing). Re-locate
@@ -820,7 +1037,7 @@ connection.onCodeAction((params) => {
       ? 'fixes the vulnerability'
       : `fixes all ${f.advisoryCount} vulnerabilities`;
 
-  const vulnInRange = vulnFixes.filter(overlapsCursor);
+  const vulnInRange = wantsQuickFix ? vulnFixes.filter(overlapsCursor) : [];
 
   /* a vuln fix matching a tier version would duplicate that tier's action —
      skip it here; the tier action below carries the fix label instead */
@@ -846,7 +1063,7 @@ connection.onCodeAction((params) => {
     });
   }
 
-  const inRange = findings.filter(overlapsCursor);
+  const inRange = wantsQuickFix ? findings.filter(overlapsCursor) : [];
 
   for (const f of inRange) {
     const attached = params.context.diagnostics.filter(
@@ -874,7 +1091,7 @@ connection.onCodeAction((params) => {
     }
   }
 
-  if (findings.length > 1) {
+  if (wantsFixAll && findings.length > 1) {
     actions.push({
       title: `Update all ${findings.length} outdated packages`,
       kind: CodeActionKind.SourceFixAll,
@@ -882,7 +1099,27 @@ connection.onCodeAction((params) => {
     });
   }
 
+  /* no edit — the server writes the file itself when the client runs the
+     command, so the action works on clients without create-file support */
+  if (wantsReport) {
+    actions.push({
+      title: 'Save dependency report',
+      kind: CodeActionKind.Source,
+      command: {
+        title: `Save dependency report to ${REPORT_FILENAME}`,
+        command: REPORT_COMMAND,
+        arguments: [uri],
+      },
+    });
+  }
+
   return actions;
+});
+
+connection.onExecuteCommand(async (params) => {
+  if (params.command !== REPORT_COMMAND) return;
+  const uri = params.arguments?.[0];
+  if (typeof uri === 'string') await writeReport(uri);
 });
 
 // ---------- lifecycle ----------
@@ -891,12 +1128,26 @@ connection.onInitialize((params) => {
   applySettings(params.initializationOptions);
   supportsDocumentChanges =
     params.capabilities.workspace?.workspaceEdit?.documentChanges === true;
+  supportsShowDocument = params.capabilities.window?.showDocument?.support === true;
+  const rootUri = params.workspaceFolders?.[0]?.uri ?? params.rootUri;
+  if (rootUri?.startsWith('file://')) {
+    try {
+      workspaceRoot = fileURLToPath(rootUri);
+    } catch {
+      workspaceRoot = null;
+    }
+  }
   return {
     capabilities: {
       textDocumentSync: TextDocumentSyncKind.Incremental,
       codeActionProvider: {
-        codeActionKinds: [CodeActionKind.QuickFix, CodeActionKind.SourceFixAll],
+        codeActionKinds: [
+          CodeActionKind.QuickFix,
+          CodeActionKind.SourceFixAll,
+          CodeActionKind.Source,
+        ],
       },
+      executeCommandProvider: { commands: [REPORT_COMMAND] },
     },
   };
 });
@@ -911,6 +1162,7 @@ documents.onDidChangeContent((e) => scheduleValidation(e.document));
 documents.onDidClose((e) => {
   findingsByUri.delete(e.document.uri);
   vulnFixesByUri.delete(e.document.uri);
+  reportByUri.delete(e.document.uri);
   connection.sendDiagnostics({ uri: e.document.uri, diagnostics: [] });
 });
 

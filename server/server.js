@@ -3081,7 +3081,7 @@ var require_main = __commonJS({
     exports2.createMessageConnection = exports2.createServerSocketTransport = exports2.createClientSocketTransport = exports2.createServerPipeTransport = exports2.createClientPipeTransport = exports2.generateRandomPipeName = exports2.StreamMessageWriter = exports2.StreamMessageReader = exports2.SocketMessageWriter = exports2.SocketMessageReader = exports2.PortMessageWriter = exports2.PortMessageReader = exports2.IPCMessageWriter = exports2.IPCMessageReader = void 0;
     var ril_1 = require_ril();
     ril_1.default.install();
-    var path = require("path");
+    var path2 = require("path");
     var os = require("os");
     var crypto_1 = require("crypto");
     var net_1 = require("net");
@@ -3217,9 +3217,9 @@ var require_main = __commonJS({
       }
       let result;
       if (XDG_RUNTIME_DIR) {
-        result = path.join(XDG_RUNTIME_DIR, `vscode-ipc-${randomSuffix}.sock`);
+        result = path2.join(XDG_RUNTIME_DIR, `vscode-ipc-${randomSuffix}.sock`);
       } else {
-        result = path.join(os.tmpdir(), `vscode-${randomSuffix}.sock`);
+        result = path2.join(os.tmpdir(), `vscode-${randomSuffix}.sock`);
       }
       const limit = safeIpcPathLengths.get(process.platform);
       if (limit !== void 0 && result.length > limit) {
@@ -8309,7 +8309,7 @@ var require_files = __commonJS({
     Object.defineProperty(exports2, "__esModule", { value: true });
     exports2.resolveModulePath = exports2.FileSystem = exports2.resolveGlobalYarnPath = exports2.resolveGlobalNodePath = exports2.resolve = exports2.uriToFilePath = void 0;
     var url = require("url");
-    var path = require("path");
+    var path2 = require("path");
     var fs = require("fs");
     var child_process_1 = require("child_process");
     function uriToFilePath(uri) {
@@ -8328,7 +8328,7 @@ var require_files = __commonJS({
           segments.shift();
         }
       }
-      return path.normalize(segments.join("/"));
+      return path2.normalize(segments.join("/"));
     }
     exports2.uriToFilePath = uriToFilePath;
     function isWindows() {
@@ -8359,7 +8359,7 @@ var require_files = __commonJS({
         Object.keys(env).forEach((key) => newEnv[key] = env[key]);
         if (nodePath && fs.existsSync(nodePath)) {
           if (newEnv[nodePathKey]) {
-            newEnv[nodePathKey] = nodePath + path.delimiter + newEnv[nodePathKey];
+            newEnv[nodePathKey] = nodePath + path2.delimiter + newEnv[nodePathKey];
           } else {
             newEnv[nodePathKey] = nodePath;
           }
@@ -8432,9 +8432,9 @@ var require_files = __commonJS({
         }
         if (prefix.length > 0) {
           if (isWindows()) {
-            return path.join(prefix, "node_modules");
+            return path2.join(prefix, "node_modules");
           } else {
-            return path.join(prefix, "lib", "node_modules");
+            return path2.join(prefix, "lib", "node_modules");
           }
         }
         return void 0;
@@ -8474,7 +8474,7 @@ var require_files = __commonJS({
           try {
             let yarn = JSON.parse(line);
             if (yarn.type === "log") {
-              return path.join(yarn.data, "node_modules");
+              return path2.join(yarn.data, "node_modules");
             }
           } catch (e) {
           }
@@ -8504,17 +8504,17 @@ var require_files = __commonJS({
       FileSystem2.isCaseSensitive = isCaseSensitive;
       function isParent(parent, child) {
         if (isCaseSensitive()) {
-          return path.normalize(child).indexOf(path.normalize(parent)) === 0;
+          return path2.normalize(child).indexOf(path2.normalize(parent)) === 0;
         } else {
-          return path.normalize(child).toLowerCase().indexOf(path.normalize(parent).toLowerCase()) === 0;
+          return path2.normalize(child).toLowerCase().indexOf(path2.normalize(parent).toLowerCase()) === 0;
         }
       }
       FileSystem2.isParent = isParent;
     })(FileSystem || (exports2.FileSystem = FileSystem = {}));
-    function resolveModulePath(workspaceRoot, moduleName, nodePath, tracer) {
+    function resolveModulePath(workspaceRoot2, moduleName, nodePath, tracer) {
       if (nodePath) {
-        if (!path.isAbsolute(nodePath)) {
-          nodePath = path.join(workspaceRoot, nodePath);
+        if (!path2.isAbsolute(nodePath)) {
+          nodePath = path2.join(workspaceRoot2, nodePath);
         }
         return resolve(moduleName, nodePath, nodePath, tracer).then((value) => {
           if (FileSystem.isParent(nodePath, value)) {
@@ -8523,10 +8523,10 @@ var require_files = __commonJS({
             return Promise.reject(new Error(`Failed to load ${moduleName} from node path location.`));
           }
         }).then(void 0, (_error) => {
-          return resolve(moduleName, resolveGlobalNodePath(tracer), workspaceRoot, tracer);
+          return resolve(moduleName, resolveGlobalNodePath(tracer), workspaceRoot2, tracer);
         });
       } else {
-        return resolve(moduleName, resolveGlobalNodePath(tracer), workspaceRoot, tracer);
+        return resolve(moduleName, resolveGlobalNodePath(tracer), workspaceRoot2, tracer);
       }
     }
     exports2.resolveModulePath = resolveModulePath;
@@ -9103,6 +9103,9 @@ function getWellformedEdit(textEdit) {
 }
 
 // src/server.ts
+var import_promises = require("node:fs/promises");
+var import_node_url = require("node:url");
+var path = __toESM(require("node:path"));
 var connection = (0, import_node.createConnection)(import_node.ProposedFeatures.all);
 var documents = new import_node.TextDocuments(TextDocument);
 var REGISTRY_URL = "https://registry.npmjs.org";
@@ -9112,6 +9115,8 @@ var AUDIT_TTL_MS = 60 * 60 * 1e3;
 var MAX_CONCURRENT = 8;
 var MAX_META_CACHE = 500;
 var MAX_DEPRECATION_LEN = 160;
+var REPORT_COMMAND = "packageBump.writeReport";
+var REPORT_FILENAME = "package-bump-report.txt";
 var DEP_SECTIONS = [
   "dependencies",
   "devDependencies",
@@ -9124,6 +9129,8 @@ var NO_DEPRECATIONS = /* @__PURE__ */ new Map();
 var messageStyle = "compact";
 var checkVulnerabilities = true;
 var supportsDocumentChanges = false;
+var supportsShowDocument = false;
+var workspaceRoot = null;
 function applySettings(settings) {
   const s = settings;
   const style = s?.message_style;
@@ -9386,6 +9393,28 @@ function collectDeps(text) {
   }
   return deps;
 }
+function collectSkipped(text) {
+  const seen = /* @__PURE__ */ new Set();
+  const out = [];
+  let parsed;
+  try {
+    parsed = JSON.parse(text);
+  } catch {
+    return out;
+  }
+  for (const section of DEP_SECTIONS) {
+    const block = parsed[section];
+    if (!block || typeof block !== "object") continue;
+    for (const [name, range] of Object.entries(block)) {
+      if (typeof range !== "string" || UPDATABLE_RE.test(range)) continue;
+      const key = `${name}@${range}`;
+      if (seen.has(key)) continue;
+      seen.add(key);
+      out.push({ name, range });
+    }
+  }
+  return out;
+}
 function findVersionRanges(doc, deps) {
   const text = doc.getText();
   const out = [];
@@ -9409,6 +9438,7 @@ function findVersionRanges(doc, deps) {
 var pendingValidation = /* @__PURE__ */ new Map();
 var findingsByUri = /* @__PURE__ */ new Map();
 var vulnFixesByUri = /* @__PURE__ */ new Map();
+var reportByUri = /* @__PURE__ */ new Map();
 function scheduleValidation(doc) {
   if (!isPackageJson(doc.uri)) return;
   const existing = pendingValidation.get(doc.uri);
@@ -9462,6 +9492,22 @@ async function validate(uri) {
     });
   }
   findingsByUri.set(uri, findings);
+  const report = {
+    uri,
+    outdated: findings.map((f) => ({
+      name: f.name,
+      current: f.current.replace(/^[\^~]/, ""),
+      tiers: f.tiers
+    })),
+    vulnerable: [],
+    deprecated: [],
+    withheld: withheld.map(({ site, tier }) => ({
+      name: site.name,
+      current: site.current.replace(/^[\^~]/, ""),
+      tier
+    })),
+    skipped: collectSkipped(fresh.getText())
+  };
   const diagnostics = findings.map((f) => {
     const bare = f.current.replace(/^[\^~]/, "");
     const highest = f.tiers[f.tiers.length - 1];
@@ -9487,6 +9533,7 @@ async function validate(uri) {
     withheldBySite.delete(site);
     const also = tier ? ` (${tier.version} also deprecated \u2014 no update offered)` : "";
     deprecationBySite.set(site, `${note}${also}`);
+    report.deprecated.push({ name: site.name, current: bare, note });
   }
   for (const [site, tier] of withheldBySite) {
     const bare = site.current.replace(/^[\^~]/, "");
@@ -9548,6 +9595,13 @@ async function validate(uri) {
       );
       const n = matched.length;
       if (safe) vulnFixes.push({ ...site, latest: safe, advisoryCount: n });
+      report.vulnerable.push({
+        name: site.name,
+        current: bare,
+        count: n,
+        severity: worst.severity,
+        fix: safe
+      });
       const count = `${n} ${n === 1 ? "vulnerability" : "vulnerabilities"}`;
       const fixNote = safe ? `, fix: ${safe}` : "";
       const deprecation = deprecationBySite.get(site);
@@ -9578,7 +9632,106 @@ async function validate(uri) {
   }
   if (documents.get(uri)?.version !== version) return;
   vulnFixesByUri.set(uri, vulnFixes);
+  reportByUri.set(uri, report);
   connection.sendDiagnostics({ uri, diagnostics });
+}
+function displayPath(fsPath) {
+  if (!workspaceRoot) return fsPath;
+  const rel = path.relative(workspaceRoot, fsPath);
+  return rel && !rel.startsWith("..") && !path.isAbsolute(rel) ? rel : fsPath;
+}
+function formatReport(data, today) {
+  const fsPath = (0, import_node_url.fileURLToPath)(data.uri);
+  const lines = [`package-bump report \u2014 ${displayPath(fsPath)}`, today, ""];
+  const nameW = Math.max(
+    0,
+    ...data.outdated.map((r) => r.name.length),
+    ...data.vulnerable.map((r) => r.name.length),
+    ...data.deprecated.map((r) => r.name.length),
+    ...data.withheld.map((r) => r.name.length),
+    ...data.skipped.map((r) => r.name.length)
+  );
+  const versionW = Math.max(
+    0,
+    ...data.outdated.map((r) => r.current.length),
+    ...data.vulnerable.map((r) => r.current.length),
+    ...data.deprecated.map((r) => r.current.length),
+    ...data.withheld.map((r) => r.current.length)
+  );
+  const row = (name, second, rest) => `  ${name.padEnd(nameW)}  ${second.padEnd(versionW)}  ${rest}`.trimEnd();
+  const section = (title, rows) => {
+    const unique = [...new Set(rows)];
+    if (!unique.length) return;
+    lines.push(`${title} (${unique.length})`, ...unique, "");
+  };
+  section(
+    "OUTDATED",
+    data.outdated.map(
+      (r) => row(
+        r.name,
+        r.current,
+        `\u2192 ${r.tiers.map((t) => `${t.version} (${t.level})`).join(" | ")}`
+      )
+    )
+  );
+  section(
+    "VULNERABLE",
+    data.vulnerable.map(
+      (r) => row(
+        r.name,
+        r.current,
+        `${r.count} ${r.count === 1 ? "vulnerability" : "vulnerabilities"} (${r.severity}${r.fix ? `, fix: ${r.fix}` : ", no safe version"})`
+      )
+    )
+  );
+  section(
+    "DEPRECATED",
+    data.deprecated.map((r) => row(r.name, r.current, r.note))
+  );
+  section(
+    "NO UPDATE OFFERED",
+    data.withheld.map(
+      (r) => row(
+        r.name,
+        r.current,
+        `${r.tier.version} (${r.tier.level}) is deprecated`
+      )
+    )
+  );
+  section(
+    "SKIPPED",
+    data.skipped.map((r) => row(r.name, r.range, ""))
+  );
+  if (lines.length === 3) lines.push("Everything is up to date.", "");
+  return lines.join("\n");
+}
+async function writeReport(uri) {
+  const data = reportByUri.get(uri);
+  if (!data) return;
+  const target = path.join(path.dirname((0, import_node_url.fileURLToPath)(uri)), REPORT_FILENAME);
+  const today = (/* @__PURE__ */ new Date()).toISOString().slice(0, 10);
+  try {
+    await (0, import_promises.writeFile)(target, formatReport(data, today), "utf8");
+  } catch (err) {
+    const reason = err instanceof Error ? err.message : String(err);
+    connection.window.showErrorMessage(
+      `Package Bump: could not write ${target} \u2014 ${reason}`
+    );
+    return;
+  }
+  const announce = () => connection.window.showInformationMessage(
+    `Package Bump: wrote ${displayPath(target)}`
+  );
+  if (!supportsShowDocument) {
+    announce();
+    return;
+  }
+  await connection.window.showDocument({ uri: (0, import_node_url.pathToFileURL)(target).toString(), takeFocus: true }).then(
+    (result) => {
+      if (!result.success) announce();
+    },
+    () => announce()
+  );
 }
 function bumpEdit(f, version = f.latest) {
   const prefix = /^[\^~]/.exec(f.current)?.[0] ?? "";
@@ -9589,7 +9742,17 @@ connection.onCodeAction((params) => {
   const doc = documents.get(uri);
   const cachedFindings = findingsByUri.get(uri) ?? [];
   const cachedVulnFixes = vulnFixesByUri.get(uri) ?? [];
-  if (!doc || !cachedFindings.length && !cachedVulnFixes.length) return [];
+  const hasReport = reportByUri.has(uri);
+  if (!doc) return [];
+  if (!cachedFindings.length && !cachedVulnFixes.length && !hasReport) {
+    return [];
+  }
+  const only = params.context.only;
+  const wants = (kind) => !only || only.some((k) => kind === k || kind.startsWith(`${k}.`));
+  const wantsQuickFix = wants(import_node.CodeActionKind.QuickFix);
+  const wantsFixAll = wants(import_node.CodeActionKind.SourceFixAll);
+  const wantsReport = hasReport && wants(import_node.CodeActionKind.Source);
+  if (!wantsQuickFix && !wantsFixAll && !wantsReport) return [];
   const freshSites = findVersionRanges(doc, collectDeps(doc.getText()));
   const relocate = (cached) => {
     const claimed = /* @__PURE__ */ new Set();
@@ -9621,7 +9784,7 @@ connection.onCodeAction((params) => {
   const actions = [];
   const overlapsCursor = (f) => f.range.start.line <= params.range.end.line && f.range.end.line >= params.range.start.line;
   const fixLabel = (f) => f.advisoryCount === 1 ? "fixes the vulnerability" : `fixes all ${f.advisoryCount} vulnerabilities`;
-  const vulnInRange = vulnFixes.filter(overlapsCursor);
+  const vulnInRange = wantsQuickFix ? vulnFixes.filter(overlapsCursor) : [];
   for (const f of vulnInRange) {
     const shadowedByBump = findings.some(
       (b) => b.name === f.name && b.range.start.line === f.range.start.line && b.tiers.some((t) => t.version === f.latest)
@@ -9636,7 +9799,7 @@ connection.onCodeAction((params) => {
       edit: editFor([bumpEdit(f)])
     });
   }
-  const inRange = findings.filter(overlapsCursor);
+  const inRange = wantsQuickFix ? findings.filter(overlapsCursor) : [];
   for (const f of inRange) {
     const attached = params.context.diagnostics.filter(
       (d) => d.source === "package-bump" && d.data?.name === f.name && d.range.start.line === f.cachedRange.start.line && d.range.start.character === f.cachedRange.start.character
@@ -9653,24 +9816,54 @@ connection.onCodeAction((params) => {
       });
     }
   }
-  if (findings.length > 1) {
+  if (wantsFixAll && findings.length > 1) {
     actions.push({
       title: `Update all ${findings.length} outdated packages`,
       kind: import_node.CodeActionKind.SourceFixAll,
       edit: editFor(findings.map((f) => bumpEdit(f)))
     });
   }
+  if (wantsReport) {
+    actions.push({
+      title: "Save dependency report",
+      kind: import_node.CodeActionKind.Source,
+      command: {
+        title: `Save dependency report to ${REPORT_FILENAME}`,
+        command: REPORT_COMMAND,
+        arguments: [uri]
+      }
+    });
+  }
   return actions;
+});
+connection.onExecuteCommand(async (params) => {
+  if (params.command !== REPORT_COMMAND) return;
+  const uri = params.arguments?.[0];
+  if (typeof uri === "string") await writeReport(uri);
 });
 connection.onInitialize((params) => {
   applySettings(params.initializationOptions);
   supportsDocumentChanges = params.capabilities.workspace?.workspaceEdit?.documentChanges === true;
+  supportsShowDocument = params.capabilities.window?.showDocument?.support === true;
+  const rootUri = params.workspaceFolders?.[0]?.uri ?? params.rootUri;
+  if (rootUri?.startsWith("file://")) {
+    try {
+      workspaceRoot = (0, import_node_url.fileURLToPath)(rootUri);
+    } catch {
+      workspaceRoot = null;
+    }
+  }
   return {
     capabilities: {
       textDocumentSync: import_node.TextDocumentSyncKind.Incremental,
       codeActionProvider: {
-        codeActionKinds: [import_node.CodeActionKind.QuickFix, import_node.CodeActionKind.SourceFixAll]
-      }
+        codeActionKinds: [
+          import_node.CodeActionKind.QuickFix,
+          import_node.CodeActionKind.SourceFixAll,
+          import_node.CodeActionKind.Source
+        ]
+      },
+      executeCommandProvider: { commands: [REPORT_COMMAND] }
     }
   };
 });
@@ -9683,6 +9876,7 @@ documents.onDidChangeContent((e) => scheduleValidation(e.document));
 documents.onDidClose((e) => {
   findingsByUri.delete(e.document.uri);
   vulnFixesByUri.delete(e.document.uri);
+  reportByUri.delete(e.document.uri);
   connection.sendDiagnostics({ uri: e.document.uri, diagnostics: [] });
 });
 documents.listen(connection);
