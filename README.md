@@ -66,7 +66,7 @@ A package that is both deprecated and vulnerable is one problem, not two, so it 
 
 ## Report
 
-**Save dependency report** in the `cmd-.` menu drops a plain-text summary next to the `package.json` and opens it — handy for pasting into a ticket or keeping a record of what's still behind. Rows trimmed from this excerpt, hence the counts:
+**Save dependency report** in the `cmd-.` menu drops a plain-text summary next to the `package.json` and opens it — handy for pasting into a ticket or keeping a record of what's still behind. `examples/package.json` produces this in full:
 
 ```
 package-bump report — examples/package.json
@@ -75,18 +75,29 @@ package-bump report — examples/package.json
 OUTDATED (7)
   typescript      5.4.0    → 5.4.5 (patch) | 5.9.3 (minor) | 7.0.2 (major)
   react           18.2.0   → 18.3.1 (minor) | 19.2.8 (major)
+  vue             3.4.0    → 3.4.38 (patch) | 3.5.41 (minor)
+  @types/node     20.0.0   → 20.19.43 (minor) | 26.2.0 (major)
+  lodash          4.17.20  → 4.17.23 (patch) | 4.18.1 (minor)
+  tar             2.2.1    → 7.5.22 (major)
+  eslint          9.0.0    → 9.39.5 (minor) | 10.8.1 (major)
 
 VULNERABLE (3)
   lodash          4.17.20  5 vulnerabilities (high, fix: 4.18.1)
+  tar             2.2.1    16 vulnerabilities (critical, fix: 7.5.21)
   request         2.87.0   1 vulnerability (moderate, no safe version)
 
 DEPRECATED (3)
+  tar             2.2.1    Old versions of tar are not supported, and contain widely publicized security vulnerabilities, which have been fixed in the current version. Please update. S…
+  request         2.87.0   request has been deprecated, see https://github.com/request/request/issues/3142
   left-pad        1.3.0    use String.prototype.padStart()
 
 NO UPDATE OFFERED (1)
   request         2.87.0   2.88.2 (minor) is deprecated
 
 SKIPPED (4)
+  some-star       *
+  some-range      >=1.0.0
+  some-local      file:../shared
   some-workspace  workspace:*
 ```
 
